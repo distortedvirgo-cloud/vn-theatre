@@ -824,3 +824,71 @@
         max-width: 44vw;
     }
 }
+
+/* ---------------- fx progress pill (pov-immersion port) ---------------- */
+
+.pov-fx-pill {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translate(-50%, 0);
+    z-index: 99999;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 18px;
+    background: #0a100e;
+    border: 1px solid rgb(13 121 105);
+    border-radius: 999px;
+    color: #dff5ee;
+    font-size: 13px;
+    line-height: 1.4;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    transition: opacity 200ms ease-out, transform 200ms ease-out;
+    animation: vntFadeUp 200ms ease-out;
+}
+.pov-fx-pill__spinner {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid #1d3a33;
+    border-top-color: rgb(94 224 197);
+    animation: vntSpin 900ms linear infinite;
+}
+.pov-fx-pill.pov-fx-pill--hidden {
+    opacity: 0;
+    transform: translate(-50%, 12px);
+    pointer-events: none;
+}
+@keyframes vntFadeUp {
+    from { opacity: 0; transform: translate(-50%, 12px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+}
+@keyframes vntSpin {
+    to { transform: rotate(360deg); }
+}
+
+/* entrance animation for generated media in chat messages */
+.pov-media-enter {
+    animation: vntMediaIn 420ms ease-out;
+}
+@keyframes vntMediaIn {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: none; }
+}
+
+.vnt-set-hint {
+    opacity: 0.65;
+    font-size: 12px;
+    align-self: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .pov-fx-pill,
+    .pov-fx-pill__spinner,
+    .pov-media-enter {
+        animation: none !important;
+        transition: none !important;
+    }
+}

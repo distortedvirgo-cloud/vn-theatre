@@ -5,7 +5,13 @@
 // an intimacy state machine ([SCENE STATE] injection), intent chips,
 // AI-suggested next moves, and per-message auto-translation.
 import { extension_settings, getContext } from '../../../extensions.js';
-import { saveSettingsDebounced, eventSource, event_types, messageFormatting, extension_prompt_types } from '../../../../script.js';
+import { saveSettingsDebounced, eventSource, event_types, messageFormatting, extension_prompt_types, appendMediaToMessage, getRequestHeaders } from '../../../../script.js';
+import { saveBase64AsFile } from '../../../utils.js';
+import { MEDIA_TYPE, MEDIA_DISPLAY, SCROLL_BEHAVIOR } from '../../../constants.js';
+// pov-immersion port: ComfyUI client, FX pill, translation-safe markup
+import { checkComfy, substituteWorkflow, loadBundledWorkflow, generateImage, blobToBase64, downscaleImageBlob } from './lib/comfy.js';
+import { showFxPill, updateFxPill, hideFxPill } from './lib/fx.js';
+import { protectHtml, restoreHtml } from './lib/presetText.js';
 
 // ===================================================================
 // 1. SETTINGS
@@ -15,10 +21,10 @@ const DEFAULT_SETTINGS = {
     enabled: false,          // overlay visible
     instruct: true,          // inject scene-tag instruction into prompts
     typewriter: true,
-    petals: true,
+    petals: true,            // legacy (kept for migration -> effect)
     sfx: true,               // comic-burst styling for ALL-CAPS onomatopoeia
     autoTranslate: false,
-    provider: 'google',      // google | libre
+    provider: 'st-proxy',    // st-proxy | google | libre | llm
     libreUrl: 'https://libretranslate.com/translate',
     libreKey: '',
     targetLang: 'ru',
@@ -30,6 +36,26 @@ const DEFAULT_SETTINGS = {
     autoChoices: true,       // suggest 3 next-move options after each reply
     intentArm: '',           // armed intent chip id (''|flirt|tease|open_up|reassure|apologize)
     judgeFailed: false,
+    // --- ambient effects (sakura, snow, rain, ...) ---
+    effect: 'sakura',
+    // --- image generation (pov-immersion port: ComfyUI) ---
+    image: {
+        enabled: true,
+        comfyUrl: 'http://127.0.0.1:8188',
+        preset: 'anima',        // anima (Qwen-Image) | sdxl
+        attachToMessage: true,  // attach the result to the last message
+        setAsBackground: true,  // use the result as the VN background
+        qualityTags: 'masterpiece, best quality, highly detailed',
+        negativePrompt: 'lowres, bad anatomy, bad hands, watermark, signature, text',
+        checkpoint: '',        // anima default: anima-base-v1.0.safetensors; sdxl: set your checkpoint
+        lora: '',
+        loraStrength: 1.0,
+        steps: 30,
+        cfg: 4,
+        seed: -1,
+        maxDim: 1280,           // longest side after downscale
+        bgMap: {},              // chatKey -> { url } generated VN background
+    },
 };
 
 function getSettings() {
@@ -38,7 +64,21 @@ function getSettings() {
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
         if (s[k] === undefined) s[k] = v;
     }
+    // migration: old petals on/off -> effect preset
+    if (!('vnt_effect_migrated' in s) && typeof s.effect === 'string') {
+        if (s.effect === 'sakura' && s.petals === false) s.effect = 'off';
+        s.vnt_effect_migrated = true;
+    }
     return s;
+}
+
+function imgSettings() {
+    const s = getSettings();
+    if (!s.image || typeof s.image !== 'object') s.image = JSON.parse(JSON.stringify(DEFAULT_SETTINGS.image));
+    for (const [k, v] of Object.entries(DEFAULT_SETTINGS.image)) {
+        if (s.image[k] === undefined) s.image[k] = v;
+    }
+    return s.image;
 }
 
 // ===================================================================
@@ -507,7 +547,7 @@ let ui = null;
 let bgFlip = false;
 let spriteFlip = false;
 let typeTimer = null;
-let petalsRAF = null;
+let effectRAF = null;
 
 function buildOverlay() {
     ui = el('div');
@@ -523,7 +563,8 @@ function buildOverlay() {
         <div class="vnt-topbar">
             <button class="vnt-btn vnt-act-backlog" title="Backlog"><i class="fa-solid fa-clock-rotate-left"></i></button>
             <button class="vnt-btn vnt-act-state" title="Relationship & scene state"><i class="fa-solid fa-heart-circle-check"></i></button>
-            <button class="vnt-btn vnt-act-petals" title="Petals"><i class="fa-solid fa-seedling"></i></button>
+            <button class="vnt-btn vnt-act-image" title="Generate scene image (ComfyUI)"><i class="fa-solid fa-image"></i></button>
+            <button class="vnt-btn vnt-act-effect" title="Effects"><i class="fa-solid fa-seedling"></i></button>
             <button class="vnt-btn vnt-act-translate" title="Translate last reply"><i class="fa-solid fa-language"></i></button>
             <button class="vnt-btn vnt-act-close" title="Exit VN mode"><i class="fa-solid fa-xmark"></i></button>
         </div>
@@ -549,12 +590,8 @@ function buildOverlay() {
     document.body.appendChild(ui);
 
     ui.querySelector('.vnt-act-close').addEventListener('click', () => setEnabled(false));
-    ui.querySelector('.vnt-act-petals').addEventListener('click', () => {
-        const s = getSettings();
-        s.petals = !s.petals;
-        saveSettingsDebounced();
-        s.petals ? startPetals() : stopPetals();
-    });
+    ui.querySelector('.vnt-act-effect').addEventListener('click', () => cycleEffect());
+    ui.querySelector('.vnt-act-image').addEventListener('click', () => generateSceneImage());
     ui.querySelector('.vnt-act-backlog').addEventListener('click', () => {
         ui.querySelector('.vnt-backlog').classList.toggle('vnt-hidden');
         renderBacklog();
@@ -601,9 +638,10 @@ function setEnabled(on) {
     if (on) {
         syncViewportHeight();
         refresh();
-        if (s.petals) startPetals();
+        if (s.effect !== 'off') startEffect();
+        updateEffectButton();
     } else {
-        stopPetals();
+        stopEffect();
         stopTypewriter();
     }
 }
@@ -696,7 +734,9 @@ function setBackground(key) {
     const b = ui.querySelector('.vnt-bg-b');
     const front = bgFlip ? a : b;
     const back = bgFlip ? b : a;
-    const url = bgUrl(key || '');
+    // a ComfyUI-generated background pins over the gradient/custom map
+    const pinned = imgSettings().bgMap?.[chatKey()]?.url ?? '';
+    const url = pinned || bgUrl(key || '');
     const style = url
         ? `background-image:url('${url}')`
         : `background-image:${placeholderGradient(key || 'night')}`;
@@ -790,7 +830,7 @@ function refresh() {
         styleSfx(tEl);
         const tr = cachedTranslation(last.id);
         const trEl = ui.querySelector('.vnt-translation');
-        trEl.textContent = tr ? tr : '';
+        if (tr && /[<>]/.test(tr)) trEl.innerHTML = tr; else trEl.textContent = tr ? tr : '';
         trEl.style.display = tr ? '' : 'none';
         trEl.scrollTop = 0;
         if (scene.background) setBackground(scene.background);
@@ -827,43 +867,209 @@ function renderBacklog() {
     list.scrollTop = list.scrollHeight;
 }
 
-// ---------------------------------------------------------------- petals
+// ------------------------------------------------- ambient effects (10 presets)
 
-function startPetals() {
+const EFFECT_PRESETS = ['sakura', 'snow', 'rain', 'fireflies', 'stars', 'embers', 'leaves', 'bubbles', 'hearts'];
+const EFFECT_ICONS = {
+    sakura: 'fa-seedling', snow: 'fa-snowflake', rain: 'fa-cloud-rain',
+    fireflies: 'fa-moon', stars: 'fa-star', embers: 'fa-fire',
+    leaves: 'fa-leaf', bubbles: 'fa-droplet', hearts: 'fa-heart', off: 'fa-ban',
+};
+const EFFECT_COUNTS = { sakura: 34, snow: 60, rain: 110, fireflies: 24, stars: 80, embers: 44, leaves: 22, bubbles: 26, hearts: 18 };
+
+function spawnParticle(kind, W, H) {
+    const rnd = (a, b) => a + Math.random() * (b - a);
+    const p = { x: Math.random() * W, y: Math.random() * H, phase: Math.random() * Math.PI * 2, size: 4 };
+    switch (kind) {
+        case 'sakura':
+            p.size = rnd(4, 11); p.vy = rnd(0.4, 1.3); p.spin = rnd(0.01, 0.04);
+            p.color = `rgba(255,${Math.round(rnd(160, 200))},${Math.round(rnd(185, 220))},${rnd(0.4, 0.7).toFixed(2)})`;
+            break;
+        case 'snow':
+            p.size = rnd(1, 3.4); p.vy = rnd(0.25, 1.0); p.spin = rnd(0.01, 0.04); p.drift = rnd(0.2, 0.7);
+            p.color = `rgba(255,255,255,${rnd(0.35, 0.85).toFixed(2)})`;
+            break;
+        case 'rain':
+            p.size = rnd(9, 18); p.vy = rnd(7, 13); p.vx = -1.4;
+            p.color = `rgba(174,203,255,${rnd(0.2, 0.4).toFixed(2)})`;
+            break;
+        case 'fireflies':
+            p.size = rnd(1.2, 2.6); p.vx = rnd(-0.4, 0.4); p.vy = rnd(-0.25, 0.25); p.spin = rnd(0.01, 0.05);
+            break;
+        case 'stars':
+            p.size = rnd(0.6, 1.8); p.speed = rnd(0.4, 1.6); p.spin = rnd(0.01, 0.05);
+            break;
+        case 'embers':
+            p.size = rnd(1, 2.8); p.vy = -rnd(0.5, 1.9); p.spin = rnd(0.03, 0.1);
+            p.color = `rgba(255,${Math.round(rnd(90, 160))},40,${rnd(0.4, 0.9).toFixed(2)})`;
+            break;
+        case 'leaves':
+            p.size = rnd(5, 10); p.vy = rnd(0.5, 1.6); p.spin = rnd(0.02, 0.06);
+            p.color = Math.random() < 0.5
+                ? `rgba(214,140,50,${rnd(0.4, 0.75).toFixed(2)})`
+                : `rgba(176,122,40,${rnd(0.4, 0.75).toFixed(2)})`;
+            break;
+        case 'bubbles':
+            p.size = rnd(3, 10); p.vy = -rnd(0.25, 0.8); p.spin = rnd(0.01, 0.05); p.drift = rnd(0.2, 0.6);
+            p.color = `rgba(190,230,255,${rnd(0.2, 0.45).toFixed(2)})`;
+            break;
+        case 'hearts':
+            p.size = rnd(4, 9); p.vy = rnd(0.35, 1.1); p.spin = rnd(0.01, 0.035);
+            p.color = `rgba(255,${Math.round(rnd(90, 140))},${Math.round(rnd(130, 170))},${rnd(0.4, 0.7).toFixed(2)})`;
+            break;
+        default:
+            p.size = 4; p.vy = 0.6; p.spin = 0.02; p.color = 'rgba(255,255,255,0.5)';
+    }
+    return p;
+}
+
+function heartPath(c, s) {
+    c.beginPath();
+    c.moveTo(0, s * 0.3);
+    c.bezierCurveTo(s * 0.9, -s * 0.5, s * 2.1, s * 0.5, 0, s * 1.5);
+    c.bezierCurveTo(-s * 2.1, s * 0.5, -s * 0.9, -s * 0.5, 0, s * 0.3);
+    c.closePath();
+}
+
+function stepParticle(p, kind, W, H) {
+    p.phase += p.spin;
+    switch (kind) {
+        case 'stars':
+            break; // fixed position, twinkle only
+        case 'fireflies':
+            p.x += p.vx + Math.sin(p.phase) * 0.35;
+            p.y += p.vy + Math.cos(p.phase * 0.8) * 0.3;
+            if (p.x < -8) p.x = W + 8; else if (p.x > W + 8) p.x = -8;
+            if (p.y < -8) p.y = H + 8; else if (p.y > H + 8) p.y = -8;
+            return;
+        case 'embers':
+            p.x += Math.sin(p.phase) * 0.5;
+            p.y += p.vy;
+            if (p.y < -10) { p.y = H + 10; p.x = Math.random() * W; }
+            return;
+        case 'bubbles':
+            p.x += Math.sin(p.phase) * p.drift;
+            p.y += p.vy;
+            if (p.y < -p.size * 2) { p.y = H + p.size * 2; p.x = Math.random() * W; }
+            return;
+        case 'rain':
+            p.y += p.vy; p.x += p.vx;
+            if (p.y > H + p.size) { p.y = -p.size; p.x = Math.random() * W; }
+            if (p.x < -10) p.x = W + 10;
+            return;
+        default:
+            p.x += Math.sin(p.phase) * (kind === 'snow' ? p.drift : 0.6);
+            p.y += p.vy;
+            if (p.y > H + 14) { p.y = -14; p.x = Math.random() * W; }
+    }
+}
+
+function drawParticle(c, p, kind) {
+    switch (kind) {
+        case 'sakura':
+        case 'leaves':
+            c.save(); c.translate(p.x, p.y); c.rotate(p.phase);
+            c.fillStyle = p.color;
+            c.beginPath();
+            c.ellipse(0, 0, p.size, p.size * (kind === 'sakura' ? 0.55 : 0.42), 0, 0, Math.PI * 2);
+            c.fill();
+            c.restore();
+            return;
+        case 'hearts':
+            c.save(); c.translate(p.x, p.y); c.rotate(Math.sin(p.phase) * 0.4);
+            c.fillStyle = p.color; heartPath(c, p.size); c.fill();
+            c.restore();
+            return;
+        case 'rain':
+            c.strokeStyle = p.color; c.lineWidth = 1.1;
+            c.beginPath(); c.moveTo(p.x, p.y); c.lineTo(p.x + p.vx * 1.6, p.y + p.size); c.stroke();
+            return;
+        case 'fireflies': {
+            const a = 0.35 + 0.65 * Math.abs(Math.sin(p.phase * 0.7));
+            const g = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.size * 5);
+            g.addColorStop(0, `rgba(224,255,160,${a.toFixed(2)})`);
+            g.addColorStop(1, 'rgba(224,255,160,0)');
+            c.fillStyle = g;
+            c.beginPath(); c.arc(p.x, p.y, p.size * 5, 0, Math.PI * 2); c.fill();
+            c.fillStyle = `rgba(240,255,200,${a.toFixed(2)})`;
+            c.beginPath(); c.arc(p.x, p.y, p.size, 0, Math.PI * 2); c.fill();
+            return;
+        }
+        case 'stars': {
+            const a = 0.15 + 0.85 * Math.abs(Math.sin(p.phase * p.speed));
+            c.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+            c.beginPath(); c.arc(p.x, p.y, p.size, 0, Math.PI * 2); c.fill();
+            return;
+        }
+        case 'bubbles':
+            c.strokeStyle = p.color; c.lineWidth = 1;
+            c.beginPath(); c.arc(p.x, p.y, p.size, 0, Math.PI * 2); c.stroke();
+            c.fillStyle = 'rgba(255,255,255,0.25)';
+            c.beginPath(); c.arc(p.x - p.size * 0.35, p.y - p.size * 0.35, p.size * 0.28, 0, Math.PI * 2); c.fill();
+            return;
+        case 'embers': {
+            const a = 0.3 + 0.7 * Math.abs(Math.sin(p.phase * 1.4));
+            c.fillStyle = p.color.replace(/[\d.]+\)$/, `${a.toFixed(2)})`);
+            c.beginPath(); c.arc(p.x, p.y, p.size, 0, Math.PI * 2); c.fill();
+            return;
+        }
+        default: // snow
+            c.fillStyle = p.color;
+            c.beginPath(); c.arc(p.x, p.y, p.size, 0, Math.PI * 2); c.fill();
+    }
+}
+
+function startEffect() {
     if (!ui) return;
+    const s = getSettings();
+    if (s.effect === 'off' || !EFFECT_PRESETS.includes(s.effect)) { stopEffect(); return; }
     const canvas = ui.querySelector('.vnt-petals');
     const ctx2d = canvas.getContext('2d');
     let W = canvas.width = window.innerWidth;
     let H = canvas.height = window.innerHeight;
-    const petals = Array.from({ length: 36 }, () => ({
-        x: Math.random() * W, y: Math.random() * H,
-        s: 4 + Math.random() * 7, vy: 0.4 + Math.random() * 0.9,
-        sway: Math.random() * Math.PI * 2, spin: 0.01 + Math.random() * 0.03,
-    }));
+    const kind = s.effect;
+    const parts = Array.from({ length: EFFECT_COUNTS[kind] ?? 30 }, () => spawnParticle(kind, W, H));
     function frame() {
         ctx2d.clearRect(0, 0, W, H);
-        ctx2d.fillStyle = 'rgba(255,183,197,0.55)';
-        for (const p of petals) {
-            p.y += p.vy; p.sway += p.spin; p.x += Math.sin(p.sway) * 0.6;
-            if (p.y > H + 12) { p.y = -12; p.x = Math.random() * W; }
-            ctx2d.beginPath();
-            ctx2d.ellipse(p.x, p.y, p.s, p.s * 0.55, p.sway, 0, Math.PI * 2);
-            ctx2d.fill();
+        for (const p of parts) {
+            stepParticle(p, kind, W, H);
+            drawParticle(ctx2d, p, kind);
         }
-        petalsRAF = requestAnimationFrame(frame);
+        effectRAF = requestAnimationFrame(frame);
     }
-    cancelAnimationFrame(petalsRAF);
-    petalsRAF = requestAnimationFrame(frame);
+    cancelAnimationFrame(effectRAF);
+    effectRAF = requestAnimationFrame(frame);
     window.addEventListener('resize', () => { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }, { once: true });
 }
 
-function stopPetals() {
-    if (petalsRAF) cancelAnimationFrame(petalsRAF);
-    petalsRAF = null;
+function stopEffect() {
+    if (effectRAF) cancelAnimationFrame(effectRAF);
+    effectRAF = null;
     if (ui) {
         const c = ui.querySelector('.vnt-petals');
         c.getContext('2d').clearRect(0, 0, c.width, c.height);
     }
+}
+
+function updateEffectButton() {
+    if (!ui) return;
+    const btn = ui.querySelector('.vnt-act-effect');
+    if (!btn) return;
+    const s = getSettings();
+    btn.innerHTML = `<i class="fa-solid ${EFFECT_ICONS[s.effect] ?? 'fa-seedling'}"></i>`;
+    btn.title = `Effects: ${s.effect} — click to cycle`;
+}
+
+function cycleEffect() {
+    const s = getSettings();
+    const list = [...EFFECT_PRESETS, 'off'];
+    const i = list.indexOf(s.effect);
+    s.effect = list[(i + 1) % list.length] ?? 'sakura';
+    saveSettingsDebounced();
+    if (overlayVisible() && s.effect !== 'off') startEffect(); else stopEffect();
+    updateEffectButton();
+    const sel = document.querySelector('#vnt-set-effect');
+    if (sel) sel.value = s.effect;
 }
 
 // ===================================================================
@@ -1099,31 +1305,75 @@ function renderDrawer() {
 }
 
 // ===================================================================
-// 12. TRANSLATION (unchanged mechanics, HTML stripped before sending)
+// 12. TRANSLATION  (pov-immersion port: ST proxy + fallback chain +
+//     HTML kept intact through protectHtml/restoreHtml tokens)
 // ===================================================================
 
-async function fetchTranslation(text) {
-    const s = getSettings();
-    const body = stripSceneTags(text)
-        .replace(/<!--[\s\S]*?-->/g, '')
-        .replace(/<[^>]*>/g, '')
-        .trim();
-    if (!body) return '';
-    if (s.provider === 'libre') {
-        const res = await fetch(s.libreUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ q: body, s: 'auto', t: s.targetLang, format: 'text', api_key: s.libreKey || undefined }),
-        });
-        if (!res.ok) throw new Error(`LibreTranslate ${res.status}`);
-        const j = await res.json();
-        return j.translatedText ?? '';
-    }
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=auto&tl=${encodeURIComponent(s.targetLang)}&q=${encodeURIComponent(body)}`;
+async function translateViaStProxy(body, lang) {
+    // ST server-side Google translation — no CORS issues, no key needed
+    const res = await fetch('/api/translate/google', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ text: body, lang }),
+    });
+    if (!res.ok) throw new Error(`ST translate proxy HTTP ${res.status}`);
+    return (await res.text()).trim();
+}
+
+async function translateViaGtx(body, lang) {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=auto&tl=${encodeURIComponent(lang)}&q=${encodeURIComponent(body)}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Google ${res.status}`);
     const j = await res.json();
     return (j[0] ?? []).map(x => x[0]).join('');
+}
+
+async function translateViaLibre(body, lang) {
+    const s = getSettings();
+    const res = await fetch(s.libreUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: body, source: 'auto', target: lang, format: 'text', api_key: s.libreKey || undefined }),
+    });
+    if (!res.ok) throw new Error(`LibreTranslate ${res.status}`);
+    const j = await res.json();
+    return j.translatedText ?? '';
+}
+
+async function translateViaLlm(body, lang) {
+    const ctx = getContext();
+    const prompt = `Translate the following roleplay message into ${lang}. Reply with ONLY the translation — same tone, no comments, no quotes:\n\n${body}`;
+    return String(await ctx.generateQuietPrompt({ quietPrompt: prompt }) ?? '').trim();
+}
+
+const TRANSLATORS = {
+    'st-proxy': translateViaStProxy,
+    google: translateViaGtx,
+    libre: translateViaLibre,
+    llm: translateViaLlm,
+};
+
+async function fetchTranslation(text) {
+    const s = getSettings();
+    const stripped = stripSceneTags(text)
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .trim();
+    if (!stripped) return '';
+    // markup (VTK cards, tags) survives translation as ⟦N⟧ placeholders
+    const { text: body, tokens } = protectHtml(stripped);
+    const chain = [s.provider, 'st-proxy', 'google', 'llm']
+        .filter((v, i, a) => a.indexOf(v) === i && TRANSLATORS[v]);
+    let out = '';
+    let lastErr = null;
+    for (const p of chain) {
+        try {
+            out = await TRANSLATORS[p](body, s.targetLang);
+            if (out && out.trim()) break;
+        } catch (e) { lastErr = e; }
+    }
+    out = String(out ?? '').trim();
+    if (!out) throw lastErr ?? new Error('all translation providers failed');
+    return restoreHtml(out, tokens).trim();
 }
 
 function putCache(id, t) {
@@ -1149,6 +1399,155 @@ export async function translateMessage(id) {
 }
 
 // ===================================================================
+// 12b. IMAGE GENERATION  (pov-immersion port: Scene Director + ComfyUI)
+// ===================================================================
+
+// SDXL resolution buckets: ratio -> [width, height] at base size 1024
+const RATIO_BINS = {
+    '21:9': [1536, 640], '16:9': [1344, 768], '3:2': [1216, 832],
+    '4:3': [1152, 896], '1:1': [1024, 1024], '4:5': [896, 1152],
+    '3:4': [832, 1216], '9:16': [768, 1344],
+};
+
+function getResolutionForRatio(ratio, baseSize = 1024) {
+    const bin = RATIO_BINS[ratio] || RATIO_BINS['16:9'];
+    if (!baseSize || baseSize === 1024) return { width: bin[0], height: bin[1] };
+    const scale = baseSize / 1024;
+    const round64 = v => Math.max(320, Math.round((v * scale) / 64) * 64);
+    return { width: round64(bin[0]), height: round64(bin[1]) };
+}
+
+function joinTags(parts) {
+    return parts.map(p => String(p ?? '').trim()).filter(Boolean).join(', ');
+}
+
+function makeClientId() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    return 'vnt-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2);
+}
+
+function buildDirectorPrompt(userName, charName, transcript) {
+    return [
+        'Pause the roleplay. You are the Scene Director for a visual-novel experience. Analyze the recent scene and decide what single image to show right now.',
+        'Rules:',
+        '- type "character": a person or creature in focus. Describe what the player sees when looking at them (face, body, action, pose, expression, clothing) including their permanent appearance (hair, eyes, species traits) so the image matches the story.',
+        '- type "background": the environment or location; no person in focus.',
+        '- type "none": the moment has no meaningful visual content (pure dialogue, abstract thoughts).',
+        '- "prompt": write in English. First 1-3 short sentences describing the exact current moment (subject, action, expression, clothing, setting, lighting), then style tags: cinematic, detailed, atmospheric. Max ~80 words. Do not use quotation marks inside.',
+        '- "subject": when type is "character" — the exact name of the person in focus, as it appears in the transcript; otherwise empty string.',
+        '- "ratio" must be one of: ' + Object.keys(RATIO_BINS).join(', ') + '. Prefer wide (16:9, 3:2) for locations, portrait (4:5, 3:4, 9:16) for close-ups of people, 1:1 for neutral shots.',
+        '- "negative": only EXTRA negative tags beyond the defaults; keep short or empty.',
+        'Respond with ONLY valid JSON (no markdown, no comments): {"type":"character|background|none","ratio":"W:H","prompt":"...","negative":"","subject":""}',
+        '',
+        'Recent scene:',
+        transcript,
+    ].join('\n');
+}
+
+function attachMediaToMessageDom(mesid, message, url) {
+    if (!message.extra || typeof message.extra !== 'object') message.extra = {};
+    message.extra.media = [{ url, title: 'VN scene', type: MEDIA_TYPE.IMAGE }];
+    if (!message.extra.media_display) message.extra.media_display = MEDIA_DISPLAY.GALLERY;
+    message.extra.media_index = 0;
+    const messageElement = jQuery(`#chat .mes[mesid="${mesid}"]`);
+    if (!messageElement?.length) return;
+    appendMediaToMessage(message, messageElement, SCROLL_BEHAVIOR.KEEP);
+}
+
+let imageBusy = false;
+
+// sceneOverride (debug/advanced): { prompt, negative?, ratio?, type? } skips the
+// director LLM call — lets power users (and tests) render a fixed scene.
+async function generateSceneImage(sceneOverride = null) {
+    if (imageBusy) { toastr.info('Image generation is already running', 'VN Theatre'); return; }
+    const img = imgSettings();
+    if (!img.enabled) { toastr.info('Image generation is disabled in settings', 'VN Theatre'); return; }
+    imageBusy = true;
+    try {
+        showFxPill('VN Theatre: checking ComfyUI…');
+        const health = await checkComfy(img.comfyUrl);
+        if (!health?.ok) throw new Error(`ComfyUI at ${img.comfyUrl} is not reachable (${health?.error ?? 'no answer'})`);
+
+        // 1) director: pick the shot from the recent transcript
+        const ctx = getContext();
+        const charName = ctx.name2 || 'the character';
+        const userName = ctx.name1 || 'the user';
+        let scene = null;
+        if (sceneOverride && typeof sceneOverride.prompt === 'string' && sceneOverride.prompt.trim()) {
+            scene = { type: sceneOverride.type ?? 'background', ratio: sceneOverride.ratio ?? '', negative: sceneOverride.negative ?? '', prompt: sceneOverride.prompt };
+        } else {
+            const recent = (ctx.chat ?? []).slice(-6);
+            if (!recent.length) throw new Error('the chat is empty');
+            const transcript = recent.map(m =>
+                `${m.is_user ? userName : (m.name || charName)}: ${stripSceneTags(m.mes).replace(/\s+/g, ' ').slice(0, 500)}`).join('\n');
+            updateFxPill('VN Theatre: directing the scene…');
+            const raw = await ctx.generateQuietPrompt({
+                quietPrompt: buildDirectorPrompt(userName, charName, transcript),
+                quietToLoud: false,
+                skipWIAN: true,
+                removeReasoning: true,
+                responseLength: 400,
+            });
+            scene = parseLenientJson(String(raw ?? ''));
+            if (!scene || !scene.prompt || scene.type === 'none') {
+                throw new Error(scene?.type === 'none'
+                    ? 'this moment has no visual content'
+                    : `director returned no usable JSON (raw: ${String(raw ?? '').trim().slice(0, 120) || 'empty'})`);
+            }
+        }
+
+        // 2) workflow: anima (Qwen-Image) or sdxl, portrait/landscape by type
+        updateFxPill(scene.type === 'character' ? 'VN Theatre: painting the character…' : 'VN Theatre: painting the scene…');
+        const engine = img.preset === 'sdxl' ? 'sdxl' : 'anima';
+        const isCharacter = scene.type === 'character';
+        const wfName = engine === 'anima' ? 'anima_t2i' : (isCharacter ? 'sdxl_portrait' : 'sdxl_default');
+        const workflowText = await loadBundledWorkflow(wfName);
+        const ratio = String(scene.ratio ?? '').trim() || (isCharacter ? '3:4' : '16:9');
+        const { width, height } = getResolutionForRatio(ratio, 1024);
+        const seed = img.seed >= 0 ? img.seed : Math.floor(Math.random() * 2 ** 48);
+        const prompt = joinTags([img.qualityTags, scene.prompt, isCharacter ? 'pov, first-person view, first-person perspective' : '']);
+        const negative = joinTags([img.negativePrompt, scene.negative]);
+        const workflow = substituteWorkflow(workflowText, {
+            prompt, negative, width, height, seed,
+            steps: img.steps, cfg: img.cfg,
+            model: img.checkpoint || (engine === 'anima' ? 'anima-base-v1.0.safetensors' : ''),
+            denoise: 1.0,
+            initImage: '',
+            lora: img.lora ?? '',
+            loraStrength: img.loraStrength ?? 1.0,
+        });
+
+        // 3) generate + persist
+        const generated = await generateImage({ url: img.comfyUrl, workflow, clientId: makeClientId() });
+        const scaled = await downscaleImageBlob(generated.blob, img.maxDim);
+        const b64 = await blobToBase64(scaled.blob);
+        const ext = String(scaled.mime || '').includes('jpeg') ? 'jpg' : 'png';
+        const baseName = 'vnt_' + (ctx.chatId ?? 'chat') + '_' + Date.now();
+        const url = await saveBase64AsFile(b64, 'vnt-scenes', baseName, ext);
+
+        // 4) deliver: attach to message + optional VN background
+        const last = lastAiMessage();
+        if (img.attachToMessage && last) attachMediaToMessageDom(last.id, last.mes, url);
+        if (img.setAsBackground && !isCharacter) {
+            img.bgMap = img.bgMap ?? {};
+            img.bgMap[chatKey()] = { url };
+            saveSettingsDebounced();
+            refresh();
+        }
+        await ctx.saveChat?.();
+        hideFxPill();
+        toastr.success(`Scene image ready (${scene.type}, ${ratio})`, 'VN Theatre');
+        return { ok: true, url, type: scene.type, ratio };
+    } catch (e) {
+        hideFxPill();
+        toastr.error(String(e?.message ?? e).slice(0, 220), 'VN Theatre');
+        return { ok: false, error: String(e?.message ?? e) };
+    } finally {
+        imageBusy = false;
+    }
+}
+
+// ===================================================================
 // 13. MESSAGE DECORATION (translate buttons, tag stripping, translations)
 // ===================================================================
 
@@ -1160,7 +1559,7 @@ function showTranslationUnderMessage(mesEl, id) {
         box = el('div', 'vn-translation');
         mesEl.querySelector('.mes_text')?.after(box);
     }
-    box.textContent = t;
+    if (/[<>]/.test(t)) box.innerHTML = t; else box.textContent = t;
 }
 
 function showTranslationUnderMessageById(id) {
@@ -1251,6 +1650,9 @@ function bindEvents() {
 
 function buildSettings() {
     const s = getSettings();
+    const img = imgSettings();
+    const effectOptions = [...EFFECT_PRESETS, 'off']
+        .map(k => `<option value="${k}" ${s.effect === k ? 'selected' : ''}>${k}</option>`).join('');
     const html = `
     <div id="vnt-settings" class="extension_settings">
         <div class="vnt-set-row"><label class="checkbox_label"><input id="vnt-set-judge" type="checkbox" ${s.judge ? 'checked' : ''}/> Relationship judge (extra LLM call per reply)</label></div>
@@ -1261,13 +1663,50 @@ function buildSettings() {
             <label>Target language <input id="vnt-set-lang" type="text" value="${esc(s.targetLang)}" size="6"/></label>
             <label>Provider
                 <select id="vnt-set-provider">
+                    <option value="st-proxy" ${s.provider === 'st-proxy' ? 'selected' : ''}>SillyTavern proxy (Google)</option>
                     <option value="google" ${s.provider === 'google' ? 'selected' : ''}>Google (free)</option>
                     <option value="libre" ${s.provider === 'libre' ? 'selected' : ''}>LibreTranslate</option>
+                    <option value="llm" ${s.provider === 'llm' ? 'selected' : ''}>LLM (current API)</option>
                 </select>
             </label>
             <label>Libre URL <input id="vnt-set-libre" type="text" value="${esc(s.libreUrl)}" size="28"/></label>
             <label>API key <input id="vnt-set-key" type="password" value="${esc(s.libreKey)}" size="12"/></label>
         </div>
+        <div class="vnt-set-row">
+            <label>Ambient effect
+                <select id="vnt-set-effect">${effectOptions}</select>
+            </label>
+            <span class="vnt-set-hint">also cycles from the overlay topbar button</span>
+        </div>
+        <div class="vnt-set-row"><b>Image generation (ComfyUI)</b></div>
+        <div class="vnt-set-row">
+            <label class="checkbox_label"><input id="vnt-set-img" type="checkbox" ${img.enabled ? 'checked' : ''}/> Enabled</label>
+            <label>Preset
+                <select id="vnt-set-img-preset">
+                    <option value="anima" ${img.preset === 'anima' ? 'selected' : ''}>Anima (Qwen-Image)</option>
+                    <option value="sdxl" ${img.preset === 'sdxl' ? 'selected' : ''}>SDXL</option>
+                </select>
+            </label>
+            <label>ComfyUI URL <input id="vnt-set-img-url" type="text" value="${esc(img.comfyUrl)}" size="24"/></label>
+        </div>
+        <div class="vnt-set-row">
+            <label class="checkbox_label"><input id="vnt-set-img-attach" type="checkbox" ${img.attachToMessage ? 'checked' : ''}/> Attach to last message</label>
+            <label class="checkbox_label"><input id="vnt-set-img-bg" type="checkbox" ${img.setAsBackground ? 'checked' : ''}/> Use as VN background</label>
+        </div>
+        <div class="vnt-set-row">
+            <label>Steps <input id="vnt-set-img-steps" type="number" value="${img.steps}" min="4" max="60" size="3"/></label>
+            <label>CFG <input id="vnt-set-img-cfg" type="number" value="${img.cfg}" min="1" max="12" step="0.5" size="3"/></label>
+            <label>Seed (-1 = random) <input id="vnt-set-img-seed" type="number" value="${img.seed}" size="10"/></label>
+            <label>Downscale <input id="vnt-set-img-maxdim" type="number" value="${img.maxDim}" min="512" max="2048" step="64" size="5"/></label>
+        </div>
+        <div class="vnt-set-row">
+            <label>Checkpoint <input id="vnt-set-img-checkpoint" type="text" value="${esc(img.checkpoint)}" placeholder="anima-base-v1.0.safetensors" size="26"/></label>
+            <label>Style LoRA <input id="vnt-set-img-lora" type="text" value="${esc(img.lora)}" placeholder="none" size="16"/></label>
+        </div>
+        <div class="vnt-set-row"><label>Quality tags <input id="vnt-set-img-quality" type="text" value="${esc(img.qualityTags)}" style="width:100%"/></label></div>
+        <div class="vnt-set-row"><label>Negative prompt <input id="vnt-set-img-negative" type="text" value="${esc(img.negativePrompt)}" style="width:100%"/></label></div>
+        <div class="vnt-set-row"><button id="vnt-set-img-clearbg" class="menu_button">Clear generated VN background</button>
+            <button id="vnt-set-img-test" class="menu_button">Test connection</button></div>
         <div class="vnt-set-row"><label>Custom backgrounds (name=url, one per line)</label><textarea id="vnt-set-bgs" rows="3" style="width:100%">${esc(s.customBgs)}</textarea></div>
         <div class="vnt-set-row"><button id="vnt-set-clear" class="menu_button">Clear translation cache</button></div>
     </div>`;
@@ -1285,6 +1724,41 @@ function buildSettings() {
     q('#vnt-set-key').addEventListener('change', e => { s.libreKey = e.target.value.trim(); saveSettingsDebounced(); });
     q('#vnt-set-bgs').addEventListener('change', e => { s.customBgs = e.target.value; saveSettingsDebounced(); refresh(); });
     q('#vnt-set-clear').addEventListener('click', () => { s.cache = {}; saveSettingsDebounced(); toastr.success('Translation cache cleared', 'VN Theatre'); });
+    // effects
+    q('#vnt-set-effect').addEventListener('change', e => {
+        s.effect = e.target.value;
+        saveSettingsDebounced();
+        if (overlayVisible() && s.effect !== 'off') startEffect(); else stopEffect();
+        updateEffectButton();
+    });
+    // image generation
+    const imgSet = (id, fn) => q(id).addEventListener('change', e => { fn(e); saveSettingsDebounced(); });
+    imgSet('#vnt-set-img', e => { img.enabled = e.target.checked; });
+    imgSet('#vnt-set-img-preset', e => { img.preset = e.target.value; });
+    imgSet('#vnt-set-img-url', e => { img.comfyUrl = e.target.value.trim() || DEFAULT_SETTINGS.image.comfyUrl; });
+    imgSet('#vnt-set-img-attach', e => { img.attachToMessage = e.target.checked; });
+    imgSet('#vnt-set-img-bg', e => { img.setAsBackground = e.target.checked; });
+    imgSet('#vnt-set-img-steps', e => { img.steps = Math.max(4, Math.min(60, Math.round(Number(e.target.value)) || 30)); });
+    imgSet('#vnt-set-img-cfg', e => { img.cfg = Math.max(1, Math.min(12, Number(e.target.value) || 4)); });
+    imgSet('#vnt-set-img-seed', e => { const n = Number(e.target.value); img.seed = Number.isFinite(n) ? Math.trunc(n) : -1; });
+    imgSet('#vnt-set-img-maxdim', e => { img.maxDim = Math.max(512, Math.min(2048, Math.round(Number(e.target.value)) || 1280)); });
+    imgSet('#vnt-set-img-checkpoint', e => { img.checkpoint = e.target.value.trim(); });
+    imgSet('#vnt-set-img-lora', e => { img.lora = e.target.value.trim(); });
+    imgSet('#vnt-set-img-quality', e => { img.qualityTags = e.target.value; });
+    imgSet('#vnt-set-img-negative', e => { img.negativePrompt = e.target.value; });
+    q('#vnt-set-img-clearbg').addEventListener('click', () => {
+        img.bgMap = {};
+        saveSettingsDebounced();
+        if (overlayVisible()) refresh();
+        toastr.success('Generated VN background cleared', 'VN Theatre');
+    });
+    q('#vnt-set-img-test').addEventListener('click', async () => {
+        img.comfyUrl = q('#vnt-set-img-url').value.trim() || img.comfyUrl;
+        saveSettingsDebounced();
+        const health = await checkComfy(img.comfyUrl);
+        if (health?.ok) toastr.success(`ComfyUI is up (${health.info?.system?.comfyui_version ?? 'ok'})`, 'VN Theatre');
+        else toastr.error(`ComfyUI unreachable: ${health?.error ?? 'no answer'}`, 'VN Theatre');
+    });
 }
 
 // ===================================================================
@@ -1324,5 +1798,15 @@ jQuery(() => {
         judgeNow: () => runJudge(lastAiMessage()?.id ?? -1),
         choicesNow: generateChoices,
         toggleDrawer,
+        cycleEffect,
+        genImage: generateSceneImage,
+        translateNow: async () => {
+            const mes = lastAiMessage();
+            if (!mes) return '';
+            const t = await translateMessage(mes.id);
+            showTranslationUnderMessageById(mes.id);
+            refresh();
+            return t;
+        },
     };
 });

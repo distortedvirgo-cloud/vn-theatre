@@ -56,8 +56,30 @@ pnotisdev/rp), with per-message auto-translation.
 
 ### Перевод
 - Кнопка на каждом сообщении, кнопка в оверлее, автоперевод новых ответов.
-- Провайдеры: Google (бесплатный gtx, без ключа) и LibreTranslate (URL + ключ).
-- Кэш по чату; HTML и scene-теги вычищаются перед отправкой в переводчик.
+- Провайдеры: **SillyTavern-прокси** (`/api/translate/google`, без CORS и ключей — по умолчанию),
+  Google (бесплатный gtx), LibreTranslate (URL + ключ) и **LLM** (текущий API).
+- Фолбэк-цепочка: выбранный провайдер → ST-прокси → Google → LLM.
+- Разметка сообщения (HTML/карточки) переживает перевод через ⟦N⟧-токены
+  (protectHtml/restoreHtml из pov-immersion) и восстанавливается в переводе.
+- Кэш по чату; scene-теги вычищаются перед отправкой в переводчик.
+
+### Генерация сцен (ComfyUI, порт pov-immersion)
+- Кнопка 🖼 в топбаре оверлея: LLM-«режиссёр» смотрит последние ~6 сообщений и
+  выбирает кадр (`character` / `background`, соотношение сторон, промпт), затем
+  картинка рисуется на локальном **ComfyUI** (`http://127.0.0.1:8188`).
+- Пресеты воркфлоу: **Anima** (Qwen-Image, `anima_t2i`, модель `anima-base-v1.0`
+  по умолчанию) и **SDXL** (`sdxl_portrait` / `sdxl_default`, нужен свой checkpoint).
+- Результат уменьшается до `downscale` и (настраивается): прикрепляется к
+  последнему сообщению чата и/или ставится фоном VN-сцены (запоминается по чату,
+  снимается кнопкой «Clear generated VN background» в настройках).
+- Настройки: URL ComfyUI, пресет, checkpoint, style LoRA, steps/CFG/seed,
+  quality/negative-теги, кнопка «Test connection».
+- Прогресс — плавающая пилюля (проверка ComfyUI → режиссёр → рисование).
+
+### Эффекты атмосферы
+Кнопка в топбаре циклично переключает 10 пресетов (или выберите в настройках):
+`sakura` · `snow` · `rain` · `fireflies` · `stars` · `embers` · `leaves` ·
+`bubbles` · `hearts` · `off`.
 
 ## Установка
 
@@ -89,12 +111,16 @@ git clone https://github.com/distortedvirgo-cloud/vn-theatre.git
 
 `window.__vnt` в консоли браузера: `.state()` — текущее состояние, `.applyJudge(json)`
 — применить оценку вручную, `.judgeNow()` / `.choicesNow()` — запуск assist-вызовов,
-`.toggleDrawer()` — панель.
+`.toggleDrawer()` — панель, `.cycleEffect()` — следующий эффект, `.translateNow()` —
+перевести последний ответ, `.genImage(sceneOverride?)` — генерация сцены (с объектом
+`{ prompt, ratio, type, negative }` — без LLM-режиссёра).
 
 ## Требования
 
 - SillyTavern ≥ 1.18 (проверено на 1.18.0-pov.2; используется object-API `generateQuietPrompt`)
 - Судья и подсказки ходов тратят токены основного провайдера
+- Генерация сцен: запущенный ComfyUI ≥ 0.33 с флагом `--enable-cors-header "*"`
+  (ST-страница ходит на него кросс-доменно) и моделями под выбранный пресет
 
 ## License
 

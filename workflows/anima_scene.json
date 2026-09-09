@@ -1,0 +1,243 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "%model%",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_06b_base.safetensors",
+      "type": "stable_diffusion"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "text": "masterpiece, best quality, sharp focus\nsplit screen, multiple views, The image on the right is different - %prompt%"
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "text": "worst quality, low quality, blurry, jpeg artifacts, watermark, signature, text"
+    }
+  },
+  "6": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "%init_image%"
+    }
+  },
+  "7": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "6",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": "%crop_w%",
+      "height": "%crop_h%",
+      "crop": "disabled"
+    }
+  },
+  "8": {
+    "class_type": "EmptyImage",
+    "inputs": {
+      "width": "%canvas_w%",
+      "height": "%canvas_h%",
+      "batch_size": 1,
+      "color": 16777215
+    }
+  },
+  "9": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "destination": [
+        "8",
+        0
+      ],
+      "source": [
+        "7",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "resize_source": false
+    }
+  },
+  "10": {
+    "class_type": "EmptyImage",
+    "inputs": {
+      "width": "%canvas_w%",
+      "height": "%canvas_h%",
+      "batch_size": 1,
+      "color": 16777215
+    }
+  },
+  "11": {
+    "class_type": "EmptyImage",
+    "inputs": {
+      "width": "%crop_w%",
+      "height": "%crop_h%",
+      "batch_size": 1,
+      "color": 0
+    }
+  },
+  "12": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "destination": [
+        "10",
+        0
+      ],
+      "source": [
+        "11",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "resize_source": false
+    }
+  },
+  "13": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "image": [
+        "12",
+        0
+      ],
+      "channel": "red"
+    }
+  },
+  "14": {
+    "class_type": "InpaintModelConditioning",
+    "inputs": {
+      "positive": [
+        "4",
+        0
+      ],
+      "negative": [
+        "5",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ],
+      "pixels": [
+        "9",
+        0
+      ],
+      "mask": [
+        "13",
+        0
+      ],
+      "noise_mask": true
+    }
+  },
+  "15": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "20",
+        0
+      ],
+      "positive": [
+        "14",
+        0
+      ],
+      "negative": [
+        "14",
+        1
+      ],
+      "latent_image": [
+        "14",
+        2
+      ],
+      "seed": "%seed%",
+      "steps": "%steps%",
+      "cfg": "%cfg%",
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "16": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "15",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "17": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "16",
+        0
+      ],
+      "width": "%crop_w%",
+      "height": "%crop_h%",
+      "x": "%crop_x%",
+      "y": 0
+    }
+  },
+  "18": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "19",
+        0
+      ],
+      "filename_prefix": "POV/anima_scene"
+    }
+  },
+  "19": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "17",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": "%width%",
+      "height": "%height%",
+      "crop": "disabled"
+    }
+  },
+  "20": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "%lora%",
+      "strength_model": "%lora_strength%",
+      "model": [
+        "1",
+        0
+      ]
+    }
+  }
+}

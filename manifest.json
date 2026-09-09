@@ -1,10 +1,10 @@
 {
-    "display_name": "VN Theatre (RP Port)",
+    "display_name": "VN Theatre (RP Port + Scenes)",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "distortedvirgo-cloud",
-    "version": "1.1.0"
+    "version": "1.2.0"
 }
