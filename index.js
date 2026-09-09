@@ -668,9 +668,18 @@ function buildOverlay() {
     ui.querySelector('.vnt-act-translate').addEventListener('click', async () => {
         const mes = lastAiMessage();
         if (!mes) return;
-        await translateMessage(mes.id);
-        showTranslationUnderMessageById(mes.id);
-        refresh();
+        // already translated: the button switches original / translation
+        if (cachedTranslation(mes.id)) { vntToggleOriginal = !vntToggleOriginal; refresh(); return; }
+        showFxPill('VN Theatre: translating…');
+        try {
+            await translateMessage(mes.id);
+            vntToggleOriginal = false;
+        } catch (e) {
+            toastr.error(String(e).slice(0, 120), 'VN Theatre');
+        } finally {
+            hideFxPill();
+            refresh();
+        }
     });
     // composer
     const input = ui.querySelector('.vnt-input');
@@ -853,6 +862,10 @@ function styleSfx(container) {
     }
 }
 
+// translation replaces the original in the VN dialog; false = original shown
+let vntToggleOriginal = false;
+let vntPaintedMesId = -1;
+
 function refresh() {
     if (!ui) return;
     const ctx = getContext();
@@ -893,22 +906,29 @@ function refresh() {
         sub.style.display = sub.textContent ? '' : 'none';
 
         const tEl = ui.querySelector('.vnt-text');
+        const tr = cachedTranslation(last.id);
+        // VN mode: the translation replaces the original inside the dialog
+        // box; the language button toggles back to the original
+        if (vntPaintedMesId !== last.id) { vntToggleOriginal = false; vntPaintedMesId = last.id; }
+        const showOriginal = vntToggleOriginal || !tr;
+        const body = showOriginal ? text : tr;
         // markdown (bold/italic) and HTML must be rendered, not shown raw:
         // typewriter only for pure prose without any markup markers
-        const hasMarkup = /[<>]|[*_`~]/.test(text);
+        const hasMarkup = /[<>]|[*_`~]/.test(body);
         if (hasMarkup || !s.typewriter) {
             stopTypewriter();
-            tEl.innerHTML = messageFormatting(text, last.mes.name || chName || '', false, false, false);
+            tEl.innerHTML = messageFormatting(body, last.mes.name || chName || '', false, false, false);
             tEl.scrollTop = tEl.scrollHeight;
         } else {
-            typewrite(tEl, text);
+            typewrite(tEl, body);
         }
         styleSfx(tEl);
-        const tr = cachedTranslation(last.id);
+        // the separate translation strip under the text is retired — the
+        // translation now lives in the dialog box itself
         const trEl = ui.querySelector('.vnt-translation');
-        if (tr && /[<>]/.test(tr)) trEl.innerHTML = tr; else trEl.textContent = tr ? tr : '';
-        trEl.style.display = tr ? '' : 'none';
-        trEl.scrollTop = 0;
+        trEl.style.display = 'none';
+        const trBtn = ui.querySelector('.vnt-act-translate');
+        if (trBtn) trBtn.title = tr ? 'Switch original / translation' : 'Translate last reply';
         if (scene.background) setBackground(scene.background);
         else if (!st.scene.background) setBackground('night');
         else setBackground(st.scene.background);
