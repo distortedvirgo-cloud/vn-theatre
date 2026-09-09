@@ -108,7 +108,7 @@
     -webkit-backdrop-filter: blur(12px);
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 18px;
-    padding: 22px 24px 16px;
+    padding: 34px 24px 16px;
     box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
     user-select: text;
     overflow: visible;
@@ -124,6 +124,13 @@
     pointer-events: none;
 }
 
+/* name + outfit/mood caption column: must stay stacked and never
+   collide with the message text below */
+.vnt-nametext {
+    min-width: 0;
+    max-width: min(60vw, 320px);
+}
+
 .vnt-chip {
     width: 48px;
     height: 48px;
@@ -137,7 +144,11 @@
 }
 
 .vnt-name {
-    display: inline-block;
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
     padding: 5px 16px;
     background: var(--vnt-accent);
     color: #fff;
@@ -347,7 +358,7 @@
         width: calc(100vw - 14px);
         bottom: calc(8px + env(safe-area-inset-bottom, 0px));
         border-radius: 14px;
-        padding: 18px 14px 12px;
+        padding: 38px 14px 12px;
         max-height: 62vh;
     }
 
