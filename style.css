@@ -425,3 +425,400 @@
         max-height: 64%;
     }
 }
+
+/* ===================================================================
+   PORTED SYSTEMS: composer, chips, choices, drawer, sfx, assist bar
+   =================================================================== */
+
+/* ------- subname (outfit / mood under the name) ------- */
+.vnt-subname {
+    margin-top: 4px;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.55);
+    letter-spacing: 0.01em;
+}
+
+/* ------- sfx comic burst ------- */
+.vnt-sfx {
+    display: inline-block;
+    font-weight: 800;
+    font-size: 1.05em;
+    letter-spacing: 0.04em;
+    color: var(--vnt-accent-bright);
+    text-shadow: 0 0 10px rgba(94, 224, 197, 0.45);
+    transform: rotate(-2deg);
+    margin: 0 2px;
+}
+
+/* ------- overlay composer ------- */
+.vnt-composer {
+    flex: 0 0 auto;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.vnt-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.vnt-chip-btn {
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.75);
+    border-radius: 9999px;
+    padding: 3px 12px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 150ms ease;
+}
+
+.vnt-chip-btn:hover {
+    background: var(--vnt-accent);
+    color: #fff;
+}
+
+.vnt-chip-btn.vnt-armed {
+    background: var(--vnt-accent);
+    color: #fff;
+    border-color: var(--vnt-accent-bright);
+    box-shadow: 0 0 10px rgba(94, 224, 197, 0.35);
+}
+
+.vnt-inputrow {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+}
+
+.vnt-input {
+    flex: 1 1 auto;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 12px;
+    color: #fff;
+    font: inherit;
+    font-size: 0.95rem;
+    padding: 8px 12px;
+    resize: none;
+    max-height: 96px;
+    min-height: 38px;
+}
+
+.vnt-input:focus {
+    outline: none;
+    border-color: var(--vnt-accent-bright);
+    box-shadow: 0 0 0 2px rgba(94, 224, 197, 0.18);
+}
+
+.vnt-send {
+    flex: 0 0 auto;
+    width: 40px;
+    height: 40px;
+}
+
+/* ------- choices bar (chat mode) ------- */
+#vnt-choices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px 10px;
+    align-items: center;
+}
+
+.vnt-choice {
+    border: 1px solid rgba(13, 121, 105, 0.55);
+    background: rgba(13, 121, 105, 0.12);
+    color: inherit;
+    border-radius: 9999px;
+    padding: 5px 14px;
+    font-size: 0.88rem;
+    cursor: pointer;
+    transition: all 150ms ease;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.vnt-choice:hover {
+    background: var(--vnt-accent);
+    color: #fff;
+}
+
+.vnt-choice-refresh {
+    padding: 5px 10px;
+}
+
+/* ------- assist status bar ------- */
+.vnt-assist-status {
+    position: fixed;
+    bottom: 8px;
+    left: 12px;
+    z-index: 9999;
+    background: rgba(0, 0, 0, 0.7);
+    color: var(--vnt-accent-bright);
+    border: 1px solid rgba(94, 224, 197, 0.3);
+    border-radius: 9999px;
+    padding: 4px 14px;
+    font-size: 0.8rem;
+    pointer-events: none;
+}
+
+/* ------- state drawer ------- */
+.vnt-drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    height: 100vh;
+    height: 100dvh;
+    width: 340px;
+    max-width: 100vw;
+    z-index: 99990;
+    background: #0a100e;
+    backdrop-filter: blur(10px);
+    border-left: 1px solid rgba(94, 224, 197, 0.25);
+    display: flex;
+    flex-direction: column;
+    box-shadow: -10px 0 40px rgba(0, 0, 0, 0.5);
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 0.9rem;
+}
+
+.vnt-drawer.vnt-hidden {
+    display: none;
+}
+
+.vnt-drawer-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    flex: 0 0 auto;
+}
+
+.vnt-drawer-title {
+    color: var(--vnt-accent-bright);
+    font-weight: 700;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.vnt-drawer-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 10px 14px 24px;
+}
+
+.vnt-sec {
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.vnt-sec-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: rgba(255, 255, 255, 0.45);
+    margin-bottom: 6px;
+}
+
+.vnt-stage {
+    font-weight: 700;
+    color: var(--vnt-accent-bright);
+    text-transform: capitalize;
+    margin-bottom: 6px;
+}
+
+.vnt-warm-track {
+    height: 8px;
+    border-radius: 9999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+}
+
+.vnt-warm-fill {
+    height: 100%;
+    border-radius: 9999px;
+    background: linear-gradient(90deg, rgb(13 121 105), rgb(94 224 197));
+    transition: width 400ms ease;
+}
+
+.vnt-warm-arousal {
+    background: linear-gradient(90deg, rgb(180 40 80), rgb(255 128 160));
+}
+
+.vnt-warm-note {
+    margin-top: 4px;
+    font-size: 0.78rem;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.vnt-stat {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 5px;
+}
+
+.vnt-stat-label {
+    flex: 0 0 78px;
+    font-size: 0.78rem;
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.vnt-stat-track {
+    flex: 1 1 auto;
+    height: 6px;
+    border-radius: 9999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+}
+
+.vnt-stat-fill {
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 400ms ease;
+}
+
+.vnt-stat-val {
+    flex: 0 0 28px;
+    text-align: right;
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.vnt-mindline {
+    font-size: 0.85rem;
+    margin-bottom: 3px;
+}
+
+.vnt-mindline b {
+    color: var(--vnt-accent-bright);
+    font-weight: 600;
+    margin-right: 4px;
+}
+
+.vnt-flagrow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.vnt-flag {
+    background: rgba(94, 224, 197, 0.12);
+    border: 1px solid rgba(94, 224, 197, 0.35);
+    color: var(--vnt-accent-bright);
+    border-radius: 9999px;
+    padding: 2px 10px;
+    font-size: 0.75rem;
+}
+
+.vnt-list-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 4px 0;
+    font-size: 0.85rem;
+    line-height: 1.4;
+}
+
+.vnt-list-row span {
+    flex: 1 1 auto;
+}
+
+.vnt-mini-btn {
+    flex: 0 0 auto;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.7);
+    border-radius: 8px;
+    padding: 2px 8px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    margin: 2px 4px 2px 0;
+}
+
+.vnt-mini-btn:hover {
+    background: var(--vnt-accent);
+    color: #fff;
+}
+
+.vnt-empty {
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 0.8rem;
+}
+
+.vnt-clothes-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 6px;
+    font-size: 0.82rem;
+}
+
+.vnt-layer {
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(94, 224, 197, 0.15);
+    color: var(--vnt-accent-bright);
+    border-radius: 9999px;
+    padding: 2px 10px;
+    font-size: 0.75rem;
+    cursor: pointer;
+}
+
+.vnt-layer.vnt-off {
+    background: rgba(255, 255, 255, 0.04);
+    color: rgba(255, 255, 255, 0.4);
+    text-decoration: line-through;
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.vnt-setrow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+/* ------- mobile ------- */
+@media (max-width: 700px) {
+    .vnt-drawer {
+        width: 100vw;
+        border-left: none;
+    }
+
+    .vnt-composer .vnt-chips {
+        row-gap: 4px;
+    }
+
+    .vnt-chip-btn {
+        padding: 3px 10px;
+        font-size: 0.75rem;
+    }
+
+    .vnt-input {
+        font-size: 16px; /* iOS zoom guard */
+    }
+
+    #vnt-choices {
+        padding: 4px 6px;
+    }
+
+    .vnt-choice {
+        font-size: 0.8rem;
+        padding: 4px 10px;
+        max-width: 44vw;
+    }
+}
