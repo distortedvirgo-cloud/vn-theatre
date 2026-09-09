@@ -599,6 +599,7 @@ function setEnabled(on) {
     ui.classList.toggle('vnt-hidden', !on);
     updatePromptInjections();
     if (on) {
+        syncViewportHeight();
         refresh();
         if (s.petals) startPetals();
     } else {
@@ -609,6 +610,29 @@ function setEnabled(on) {
 
 function overlayVisible() {
     return ui && !ui.classList.contains('vnt-hidden');
+}
+
+// Real browsers lie about vh/dvh when the URL bar / keyboard resize the page:
+// the visible viewport can be smaller than 100dvh, pushing bottom-anchored UI
+// off-screen. Pin the overlay and drawer to the actual visual viewport in px.
+function syncViewportHeight() {
+    const vv = window.visualViewport;
+    const h = Math.round(vv ? vv.height : window.innerHeight);
+    const top = Math.round(vv ? vv.offsetTop : 0);
+    for (const node of [ui, drawer]) {
+        if (!node) continue;
+        node.style.height = `${h}px`;
+        node.style.top = `${top}px`;
+    }
+}
+
+function bindViewportSync() {
+    window.addEventListener('resize', syncViewportHeight);
+    window.addEventListener('orientationchange', syncViewportHeight);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', syncViewportHeight);
+        window.visualViewport.addEventListener('scroll', syncViewportHeight);
+    }
 }
 
 function lastAiMessage() {
@@ -948,7 +972,10 @@ let drawer = null;
 function toggleDrawer() {
     if (!drawer) buildDrawer();
     drawer.classList.toggle('vnt-hidden');
-    if (!drawer.classList.contains('vnt-hidden')) renderDrawer();
+    if (!drawer.classList.contains('vnt-hidden')) {
+        syncViewportHeight();
+        renderDrawer();
+    }
 }
 
 function buildDrawer() {
@@ -1286,6 +1313,7 @@ jQuery(() => {
     buildSettings();
     addMenuButton();
     bindEvents();
+    bindViewportSync();
     if (getSettings().enabled) setEnabled(true);
     updatePromptInjections();
     setTimeout(decorateAllMessages, 800);
