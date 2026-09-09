@@ -125,7 +125,13 @@ function buildOverlay() {
             <button class="vnt-btn vnt-act-translate" title="Translate last reply"><i class="fa-solid fa-language"></i></button>
             <button class="vnt-btn vnt-act-close" title="Exit VN mode"><i class="fa-solid fa-xmark"></i></button>
         </div>
-        <div class="vnt-backlog vnt-hidden"><div class="vnt-backlog-list"></div></div>
+        <div class="vnt-backlog vnt-hidden">
+            <div class="vnt-backlog-head">
+                <button class="vnt-btn vnt-bl-close" title="Close backlog"><i class="fa-solid fa-xmark"></i></button>
+                <span>Backlog</span>
+            </div>
+            <div class="vnt-backlog-list"></div>
+        </div>
         <div class="vnt-dialog">
             <div class="vnt-namerow"><img class="vnt-chip" alt=""><div class="vnt-name"></div></div>
             <div class="vnt-text"></div>
@@ -143,6 +149,9 @@ function buildOverlay() {
     ui.querySelector('.vnt-act-backlog').addEventListener('click', () => {
         ui.querySelector('.vnt-backlog').classList.toggle('vnt-hidden');
         renderBacklog();
+    });
+    ui.querySelector('.vnt-bl-close').addEventListener('click', () => {
+        ui.querySelector('.vnt-backlog').classList.add('vnt-hidden');
     });
     ui.querySelector('.vnt-act-translate').addEventListener('click', async () => {
         const ctx = getContext();
@@ -332,7 +341,9 @@ function renderBacklog() {
         const row = el('div', 'vnt-backlog-row' + (m.is_user ? ' vnt-user' : ''));
         const name = m.is_user ? (m.name || getContext().name1) : (m.name || getContext().name2);
         row.appendChild(el('div', 'vnt-backlog-name', esc(name)));
-        row.appendChild(el('div', 'vnt-backlog-text', esc(stripSceneTags(m.mes))));
+        const textEl = el('div', 'vnt-backlog-text');
+        textEl.innerHTML = messageFormatting(stripSceneTags(m.mes), name, false, false, m.is_user);
+        row.appendChild(textEl);
         const tr = cachedTranslation(i);
         if (tr) row.appendChild(el('div', 'vnt-backlog-tr', esc(tr)));
         list.appendChild(row);
@@ -404,7 +415,11 @@ function clearInstruction() {
 
 async function fetchTranslation(text) {
     const s = getSettings();
-    const body = stripSceneTags(text);
+    // translate prose only: no scene tags, no HTML comments/blocks (VTK etc.)
+    const body = stripSceneTags(text)
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<[^>]*>/g, '')
+        .trim();
     if (!body) return '';
     if (s.provider === 'libre') {
         const res = await fetch(s.libreUrl, {
