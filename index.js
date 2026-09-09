@@ -945,7 +945,7 @@ function maybeAutoBackground(prompt) {
     img.lastAutoBgAt = now;
     img.lastAutoBgPrompt = prompt;
     saveSettingsDebounced();
-    generateSceneImage({ type: 'background', ratio: '16:9', prompt, negative: img.negativePrompt });
+    generateSceneImage({ type: 'background', ratio: getScreenRatio(), prompt, negative: img.negativePrompt });
 }
 
 function renderBacklog() {
@@ -1529,6 +1529,22 @@ function getResolutionForRatio(ratio, baseSize = 1024) {
     return { width: round64(bin[0]), height: round64(bin[1]) };
 }
 
+/**
+ * Backdrops must match the screen the user actually looks at: a desktop
+ * window gets 16:9, a portrait phone 9:16. Picks the ratio bin closest to
+ * the current viewport aspect (covers landscape phones/tablets too).
+ */
+function getScreenRatio() {
+    const target = Math.max(window.innerWidth, 1) / Math.max(window.innerHeight, 1);
+    let best = '16:9', bestDiff = Infinity;
+    for (const bin of Object.keys(RATIO_BINS)) {
+        const [w, h] = bin.split(':').map(Number);
+        const diff = Math.abs(w / h - target);
+        if (diff < bestDiff) { bestDiff = diff; best = bin; }
+    }
+    return best;
+}
+
 function joinTags(parts) {
     return parts.map(p => String(p ?? '').trim()).filter(Boolean).join(', ');
 }
@@ -1611,16 +1627,21 @@ async function generateSceneImage(sceneOverride = null) {
                 // tags, or a template from the current scene state
                 const tags = parseSceneTag(lastAiMessage()?.mes?.mes ?? '');
                 if (tags.bggen) {
-                    scene = { type: 'background', ratio: '16:9', prompt: tags.bggen, negative: '' };
+                    scene = { type: 'background', ratio: getScreenRatio(), prompt: tags.bggen, negative: '' };
                 } else {
                     const stf = getState();
                     scene = {
-                        type: 'background', ratio: '16:9', negative: '',
+                        type: 'background', ratio: getScreenRatio(), negative: '',
                         prompt: `${stf.scene.background || 'night'} scenery environment, detailed background, cinematic lighting, no people`,
                     };
                 }
                 toastr.info('Director LLM is quiet — using the scene-tag prompt instead', 'VN Theatre');
             }
+        }
+        // backdrops always match the user's screen orientation; the director
+        // only picks portrait framing for character shots
+        if (scene && (!scene.type || scene.type === 'background')) {
+            scene.ratio = getScreenRatio();
         }
 
         // 2) workflow: anima (Qwen-Image) or sdxl, portrait/landscape by type
@@ -1629,7 +1650,7 @@ async function generateSceneImage(sceneOverride = null) {
         const isCharacter = scene.type === 'character';
         const wfName = engine === 'anima' ? 'anima_t2i' : (isCharacter ? 'sdxl_portrait' : 'sdxl_default');
         const workflowText = await loadBundledWorkflow(wfName);
-        const ratio = String(scene.ratio ?? '').trim() || (isCharacter ? '3:4' : '16:9');
+        const ratio = String(scene.ratio ?? '').trim() || (isCharacter ? '3:4' : getScreenRatio());
         const { width, height } = getResolutionForRatio(ratio, 1024);
         const seed = img.seed >= 0 ? img.seed : Math.floor(Math.random() * 2 ** 48);
         const prompt = joinTags([img.qualityTags, scene.prompt, isCharacter ? 'pov, first-person view, first-person perspective' : '']);
@@ -1930,6 +1951,7 @@ jQuery(() => {
         choicesNow: generateChoices,
         toggleDrawer,
         cycleEffect,
+        screenRatio: getScreenRatio,
         genImage: generateSceneImage,
         judgeRaw: async () => {
             const ctx = getContext();
