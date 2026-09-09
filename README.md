@@ -19,9 +19,13 @@ pnotisdev/rp), with per-message auto-translation.
   своя картинка из настроек), `mood`/`outfit` — подпись у имени + запоминается движком.
 - Лепестки сакуры (canvas), бэклог на 30 сообщений, композер прямо в оверлее
   (можно отвечать, не выходя из VN-режима), комикс-бёрсты для звукоподражаний.
+- Markdown-разметка сообщений (**жирный**, *курсив*, цитаты, код) рендерится
+  в диалоговом боксе корректно (через `messageFormatting`), как в обычном чате.
 
 ### Движок отношений (per-reply judge)
-После каждого ответа модели фоновый LLM-вызов (`generateQuietPrompt`) оценивает ход:
+После каждого ответа модели фоновый LLM-вызов (`generateRaw` — чистый вызов без
+карточки и пресета, только наш промпт; при незавершённом API расширение само
+нажимает Connect в панели) оценивает ход:
 - **7 шкал** (affection/trust/chemistry/comfort/respect/curiosity/tension, −2..+2 за ход),
   накопление 0..100 и **стадии**: near_strangers → acquaintances → warming_up →
   getting_close → close → sweethearts;
@@ -54,10 +58,31 @@ pnotisdev/rp), with per-message auto-translation.
 - **AI-выборы хода** — после каждого ответа 3 варианта следующего действия
   (кнопки над полем ввода; клик = отправить).
 
+### ИИ управляет сценой
+Модель держит полный контроль над презентацией через расширенный scene-тег:
+
+```
+<<scene: expression=shy, background=cafe, mood=romantic, outfit=linen-dress, effect=sakura, bggen=moonlit fantasy forest glade with fireflies>>
+```
+
+- `effect` — атмосферный эффект оверлея (sakura/snow/rain/fireflies/stars/
+  embers/leaves/bubbles/hearts/off) — переключается немедленно, когда модель
+  меняет место или погоду;
+- `bggen` — короткий англоязычный промпт для **генерации фона** (ComfyUI):
+  расширение само директит генерацию (кулисный 16:9, кулдаун 90 сек) и
+  прикрепляет её как фон чата и VN-сцены.
+
+### Картинки персонажа в VN
+Изображения, сгенерированные для персонажа (media-вложение с заголовком
+«VN scene — character»), становятся спрайтом на сцене; фоновые — закреплённым
+фоном. Ручная кнопка **Generate scene image** директит выстрел LLM-режиссёром
+(тип кадра character/background, соотношение, промпт) и рендерит его в ComfyUI.
+
 ### Перевод
-- Кнопка на каждом сообщении, кнопка в оверлее, автоперевод новых ответов.
-- Провайдеры: **SillyTavern-прокси** (`/api/translate/google`, без CORS и ключей — по умолчанию),
-  Google (бесплатный gtx), LibreTranslate (URL + ключ) и **LLM** (текущий API).
+- Автоперевод новых ответов **включён по умолчанию**, провайдер — **LLM**
+  (тот же API, что у переписки с ботом).
+- Провайдеры: **LLM** (по умолчанию), **SillyTavern-прокси** (`/api/translate/google`,
+  без CORS и ключей), Google (бесплатный gtx), LibreTranslate (URL + ключ).
 - Фолбэк-цепочка: выбранный провайдер → ST-прокси → Google → LLM.
 - Разметка сообщения (HTML/карточки) переживает перевод через ⟦N⟧-токены
   (protectHtml/restoreHtml из pov-immersion) и восстанавливается в переводе.
@@ -111,8 +136,9 @@ git clone https://github.com/distortedvirgo-cloud/vn-theatre.git
 
 `window.__vnt` в консоли браузера: `.state()` — текущее состояние, `.applyJudge(json)`
 — применить оценку вручную, `.judgeNow()` / `.choicesNow()` — запуск assist-вызовов,
-`.toggleDrawer()` — панель, `.cycleEffect()` — следующий эффект, `.translateNow()` —
-перевести последний ответ, `.genImage(sceneOverride?)` — генерация сцены (с объектом
+`.judgeRaw()` — сырой ответ судьи (диагностика), `.toggleDrawer()` — панель,
+`.cycleEffect()` — следующий эффект, `.translateNow()` — перевести последний ответ,
+`.genImage(sceneOverride?)` — генерация сцены (с объектом
 `{ prompt, ratio, type, negative }` — без LLM-режиссёра).
 
 ## Требования

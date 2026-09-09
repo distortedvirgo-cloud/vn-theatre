@@ -23,8 +23,8 @@ const DEFAULT_SETTINGS = {
     typewriter: true,
     petals: true,            // legacy (kept for migration -> effect)
     sfx: true,               // comic-burst styling for ALL-CAPS onomatopoeia
-    autoTranslate: false,
-    provider: 'st-proxy',    // st-proxy | google | libre | llm
+    autoTranslate: true,
+    provider: 'llm',         // llm (user's chat API) | st-proxy | google | libre
     libreUrl: 'https://libretranslate.com/translate',
     libreKey: '',
     targetLang: 'ru',
@@ -45,6 +45,7 @@ const DEFAULT_SETTINGS = {
         preset: 'anima',        // anima (Qwen-Image) | sdxl
         attachToMessage: true,  // attach the result to the last message
         setAsBackground: true,  // use the result as the VN background
+        autoFromTag: true,      // AI may auto-generate backgrounds via bggen= tags
         qualityTags: 'masterpiece, best quality, highly detailed',
         negativePrompt: 'lowres, bad anatomy, bad hands, watermark, signature, text',
         checkpoint: '',        // anima default: anima-base-v1.0.safetensors; sdxl: set your checkpoint
@@ -68,6 +69,13 @@ function getSettings() {
     if (!('vnt_effect_migrated' in s) && typeof s.effect === 'string') {
         if (s.effect === 'sakura' && s.petals === false) s.effect = 'off';
         s.vnt_effect_migrated = true;
+    }
+    // migration v1.3: auto-translate ON via the user's chat API
+    if (!s.vnt_v13_migrated) {
+        if (s.provider === 'st-proxy' || s.provider === 'google') s.provider = 'llm';
+        if (s.autoTranslate === false) s.autoTranslate = true;
+        s.judgeFailed = false; // stale failure flag would hide new error toasts
+        s.vnt_v13_migrated = true;
     }
     return s;
 }
@@ -129,6 +137,8 @@ const CLOTHING_LAYERS = ['outerwear', 'top', 'bottoms', 'underwear', 'shoes'];
 const BODY_REGIONS = ['lips', 'neck', 'ears', 'chest', 'breasts', 'waist', 'hips', 'thighs', 'between_legs', 'back', 'hands'];
 
 const SCENE_TAG_RE = /<<\s*scene\s*:\s*([^>]*?)>>/gi;
+// attr values may contain spaces: bggen=a misty glade at dawn, pale sun
+const SCENE_ATTR_RE = /([\w-]+)\s*=\s*((?:(?!,\s*[\w-]+\s*=)[\s\S])*)/gi;
 
 const DIFFICULTY_SCALE = { gentle: 0.5, normal: 1, harsh: 1.5 };
 
@@ -233,8 +243,9 @@ export function parseSceneTag(raw) {
     if (!raw) return out;
     const matches = [...raw.matchAll(SCENE_TAG_RE)];
     if (!matches.length) return out;
-    for (const m of matches[matches.length - 1][1].matchAll(/(\w+)\s*=\s*([^\s,;|]+)/g)) {
-        out[m[1].toLowerCase()] = m[2].toLowerCase();
+    const body = matches[matches.length - 1][1];
+    for (const m of body.matchAll(SCENE_ATTR_RE)) {
+        out[m[1].toLowerCase()] = m[2].trim().toLowerCase();
     }
     return out;
 }
@@ -247,16 +258,18 @@ function sceneInstruction() {
     const st = getState();
     const lines = [
         '[Scene direction: End every response with a single tag in this exact format. The tag is metadata only: never mention or explain it in the dialogue.]',
-        '<<scene: expression=ID, background=ID, mood=ID, outfit=ID>>',
+        '<<scene: expression=ID, background=ID, mood=ID, outfit=ID, effect=ID>>',
         `expression IDs: ${EXPRS.join(', ')}.`,
         `background IDs: ${BG_KEYS.join(', ')}.`,
         `mood IDs: ${MOOD_IDS.join(', ')}.`,
+        `effect IDs: ${[...EFFECT_PRESETS, 'off'].join(', ')} — ambient atmosphere overlay. Pick the one matching weather and place: rain in a storm, snow in winter, fireflies on a summer night in nature, embers near a fire, leaves in an autumn wind, bubbles near water, hearts during romance, sakura under blooming trees, off indoors or in neutral moments. Change effect only when the scene or weather actually changes.`,
     ];
     if (st.outfit.char) {
         lines.push(`The character is currently wearing "${st.outfit.char}". Only use a different outfit ID when the story has actually changed what they are wearing; never change an outfit just because the mood shifted.`);
     } else {
         lines.push('outfit: a 1-2 word description of what the character is wearing (lowercase, hyphens for spaces). Keep it consistent between replies unless the story changes their clothes.');
     }
+    lines.push('Optional bggen: when the location changes to something visually striking, you may add bggen=a short English image prompt describing ONLY the environment, no characters (example: bggen=misty forest glade at dawn, pale sun rays through ancient trees). Use bggen sparingly — only when the place genuinely changes; otherwise just use background=ID.');
     lines.push('Pick whichever IDs best match the character\'s emotion and the current setting. The tag must be the last line of the reply.]');
     return lines.join(' ');
 }
@@ -307,6 +320,53 @@ function parseLenientJson(raw) {
     try { return JSON.parse(s); } catch { return null; }
 }
 
+const API_CONNECT_BUTTONS = {
+    openai: '#api_button_openai',
+    novel: '#api_button_novel',
+    textgenerationwebui: '#api_button_textgenerationwebui',
+};
+
+/**
+ * generateQuietPrompt silently resolves empty when online_status is
+ * 'no_connection' (core Generate returns Promise.resolve() without even a
+ * fetch), so every aux call must pre-check and try to reconnect via the
+ * panel's own Connect button first.
+ */
+async function ensureApiConnected() {
+    const ctx = getContext();
+    if (ctx.onlineStatus && ctx.onlineStatus !== 'no_connection') return true;
+    const mainApi = document.querySelector('#main_api')?.value;
+    const btnSel = API_CONNECT_BUTTONS[mainApi] ?? '#api_button_openai';
+    const btn = document.querySelector(btnSel);
+    if (!btn) return false;
+    console.info('VN Theatre: API is not connected — pressing', btnSel);
+    btn.click();
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 1000));
+        const st = getContext().onlineStatus;
+        if (st && st !== 'no_connection') {
+            toastr.success(`API connected (${st})`, 'VN Theatre');
+            return true;
+        }
+    }
+    return false;
+}
+
+async function requireApi() {
+    if (await ensureApiConnected()) return;
+    throw new Error('chat API is not connected — open the API panel and press Connect');
+}
+
+/**
+ * generateQuietPrompt runs the full Generate pipeline — character card,
+ * persona, world info and the user's system preset — so a JSON-only
+ * instruction drowns in roleplay directives and the model answers in
+ * character instead. generateRaw sends only our own messages.
+ */
+const JSON_ONLY_SYSTEM =
+    'You are a JSON data pipeline for a roleplay companion app. Ignore any roleplay, style or formatting instructions: reply with exactly one JSON value (object or array, as requested) and absolutely nothing else — no prose, no markdown fences, no commentary.';
+
 let judgeBusy = false;
 
 async function runJudge(mesId) {
@@ -338,7 +398,12 @@ async function runJudge(mesId) {
     judgeBusy = true;
     setAssistStatus('Reading the relationship...');
     try {
-        const raw = await ctx.generateQuietPrompt({ quietPrompt: buildJudgePrompt(st, transcript, charName, userName, armed) });
+        await requireApi();
+        const raw = await ctx.generateRaw({
+            prompt: buildJudgePrompt(st, transcript, charName, userName, armed),
+            systemPrompt: JSON_ONLY_SYSTEM,
+        });
+        if (!String(raw ?? '').trim()) throw new Error('empty reply — connect the chat API first');
         const parsed = parseLenientJson(String(raw ?? ''));
         if (!parsed) throw new Error('judge returned no JSON');
         applyJudgePayload(parsed, { mesId: lastAi, scale: DIFFICULTY_SCALE[s.difficulty] ?? 1 });
@@ -791,6 +856,8 @@ function styleSfx(container) {
 function refresh() {
     if (!ui) return;
     const ctx = getContext();
+    const s = getSettings();
+    const img = imgSettings();
     const last = lastAiMessage();
     const char = ctx.characters?.[ctx.characterId];
     const chName = ctx.groupId ? (last?.mes?.name ?? ctx.name2) : (char?.name ?? ctx.name2);
@@ -801,7 +868,13 @@ function refresh() {
     } else if (char?.avatar) {
         avatarUrl = `/thumbnail?type=avatar&file=${encodeURIComponent(char.avatar)}`;
     }
-    setSprite(avatarUrl);
+    // generated media attached to the message wins: character shots become the
+    // stage sprite, background shots pin the VN background via bgMap
+    const mediaList = Array.isArray(last?.mes?.extra?.media) ? last.mes.extra.media : [];
+    const mediaImage = mediaList.find(m => String(m?.type ?? '').toLowerCase() === 'image' && m?.url);
+    let spriteUrl = avatarUrl;
+    if (mediaImage && /character/i.test(String(mediaImage.title ?? ''))) spriteUrl = mediaImage.url;
+    setSprite(spriteUrl);
 
     const st = getState();
     if (last) {
@@ -820,7 +893,10 @@ function refresh() {
         sub.style.display = sub.textContent ? '' : 'none';
 
         const tEl = ui.querySelector('.vnt-text');
-        if (/<[a-z!][^\s>]*>/i.test(text) || !getSettings().typewriter) {
+        // markdown (bold/italic) and HTML must be rendered, not shown raw:
+        // typewriter only for pure prose without any markup markers
+        const hasMarkup = /[<>]|[*_`~]/.test(text);
+        if (hasMarkup || !s.typewriter) {
             stopTypewriter();
             tEl.innerHTML = messageFormatting(text, last.mes.name || chName || '', false, false, false);
             tEl.scrollTop = tEl.scrollHeight;
@@ -842,7 +918,34 @@ function refresh() {
         if (scene.mood && scene.mood !== st.scene.mood) { st.scene.mood = scene.mood; sceneChanged = true; }
         if (scene.outfit && scene.outfit !== st.outfit.char) { st.outfit.char = scene.outfit; sceneChanged = true; }
         if (sceneChanged) { persistState(); }
+        // AI-driven ambience: the model's tag switches the particle effect...
+        if (scene.effect && EFFECT_PRESETS.includes(scene.effect) && scene.effect !== s.effect) {
+            s.effect = scene.effect;
+            saveSettingsDebounced();
+            if (overlayVisible() && s.effect !== 'off') startEffect(); else stopEffect();
+            updateEffectButton();
+            const sel = document.querySelector('#vnt-set-effect');
+            if (sel) sel.value = s.effect;
+        }
+        // ...and can request a generated background via bggen= (cooldown-guarded)
+        if (scene.bggen && img.enabled && img.autoFromTag) maybeAutoBackground(scene.bggen);
     }
+}
+
+// auto-generate a VN background from the model's bggen= tag; guarded by a
+// cooldown + same-prompt check so a burst of replies can't queue generations
+const AUTO_BG_COOLDOWN_MS = 90000;
+
+function maybeAutoBackground(prompt) {
+    const img = imgSettings();
+    const now = Date.now();
+    if (imageBusy) return;
+    if (now - (img.lastAutoBgAt ?? 0) < AUTO_BG_COOLDOWN_MS) return;
+    if (prompt === img.lastAutoBgPrompt && img.bgMap?.[chatKey()]?.url) return;
+    img.lastAutoBgAt = now;
+    img.lastAutoBgPrompt = prompt;
+    saveSettingsDebounced();
+    generateSceneImage({ type: 'background', ratio: '16:9', prompt, negative: img.negativePrompt });
 }
 
 function renderBacklog() {
@@ -1125,7 +1228,12 @@ async function generateChoices() {
     ].join('\n');
     setAssistStatus('Thinking of options...');
     try {
-        const raw = await ctx.generateQuietPrompt({ quietPrompt: prompt });
+        await requireApi();
+        const raw = await ctx.generateRaw({
+            prompt,
+            systemPrompt: JSON_ONLY_SYSTEM,
+        });
+        if (!String(raw ?? '').trim()) throw new Error('empty reply — connect the chat API first');
         const start = String(raw).indexOf('[');
         const end = String(raw).lastIndexOf(']');
         if (start === -1 || end <= start) throw new Error('no JSON array');
@@ -1342,8 +1450,12 @@ async function translateViaLibre(body, lang) {
 
 async function translateViaLlm(body, lang) {
     const ctx = getContext();
-    const prompt = `Translate the following roleplay message into ${lang}. Reply with ONLY the translation — same tone, no comments, no quotes:\n\n${body}`;
-    return String(await ctx.generateQuietPrompt({ quietPrompt: prompt }) ?? '').trim();
+    await requireApi();
+    const prompt = `Translate the following roleplay message into ${lang}. Reply with ONLY the translation — same tone, no comments, no quotes. Keep the markdown formatting (**bold**, *italic*, quotes) and line breaks intact:\n\n${body}`;
+    return String(await ctx.generateRaw({
+        prompt,
+        systemPrompt: 'You are a translation engine. Reply with only the translated text — nothing else.',
+    }) ?? '').trim();
 }
 
 const TRANSLATORS = {
@@ -1444,9 +1556,9 @@ function buildDirectorPrompt(userName, charName, transcript) {
     ].join('\n');
 }
 
-function attachMediaToMessageDom(mesid, message, url) {
+function attachMediaToMessageDom(mesid, message, url, title) {
     if (!message.extra || typeof message.extra !== 'object') message.extra = {};
-    message.extra.media = [{ url, title: 'VN scene', type: MEDIA_TYPE.IMAGE }];
+    message.extra.media = [{ url, title: title ?? 'VN scene', type: MEDIA_TYPE.IMAGE }];
     if (!message.extra.media_display) message.extra.media_display = MEDIA_DISPLAY.GALLERY;
     message.extra.media_index = 0;
     const messageElement = jQuery(`#chat .mes[mesid="${mesid}"]`);
@@ -1480,19 +1592,34 @@ async function generateSceneImage(sceneOverride = null) {
             if (!recent.length) throw new Error('the chat is empty');
             const transcript = recent.map(m =>
                 `${m.is_user ? userName : (m.name || charName)}: ${stripSceneTags(m.mes).replace(/\s+/g, ' ').slice(0, 500)}`).join('\n');
+            // reasoning models burn their token budget on thinking first — never
+            // cap this call with responseLength, or content comes back empty
             updateFxPill('VN Theatre: directing the scene…');
-            const raw = await ctx.generateQuietPrompt({
-                quietPrompt: buildDirectorPrompt(userName, charName, transcript),
-                quietToLoud: false,
-                skipWIAN: true,
-                removeReasoning: true,
-                responseLength: 400,
-            });
-            scene = parseLenientJson(String(raw ?? ''));
-            if (!scene || !scene.prompt || scene.type === 'none') {
-                throw new Error(scene?.type === 'none'
-                    ? 'this moment has no visual content'
-                    : `director returned no usable JSON (raw: ${String(raw ?? '').trim().slice(0, 120) || 'empty'})`);
+            let parsed = null;
+            try {
+                await requireApi();
+                const raw = await ctx.generateRaw({
+                    prompt: buildDirectorPrompt(userName, charName, transcript),
+                    systemPrompt: JSON_ONLY_SYSTEM,
+                });
+                parsed = parseLenientJson(String(raw ?? ''));
+            } catch { parsed = null; }
+            if (parsed && parsed.prompt && parsed.type !== 'none') {
+                scene = parsed;
+            } else {
+                // fallback without a second LLM call: the chat model's own scene
+                // tags, or a template from the current scene state
+                const tags = parseSceneTag(lastAiMessage()?.mes?.mes ?? '');
+                if (tags.bggen) {
+                    scene = { type: 'background', ratio: '16:9', prompt: tags.bggen, negative: '' };
+                } else {
+                    const stf = getState();
+                    scene = {
+                        type: 'background', ratio: '16:9', negative: '',
+                        prompt: `${stf.scene.background || 'night'} scenery environment, detailed background, cinematic lighting, no people`,
+                    };
+                }
+                toastr.info('Director LLM is quiet — using the scene-tag prompt instead', 'VN Theatre');
             }
         }
 
@@ -1527,7 +1654,9 @@ async function generateSceneImage(sceneOverride = null) {
 
         // 4) deliver: attach to message + optional VN background
         const last = lastAiMessage();
-        if (img.attachToMessage && last) attachMediaToMessageDom(last.id, last.mes, url);
+        if (img.attachToMessage && last) {
+            attachMediaToMessageDom(last.id, last.mes, url, isCharacter ? 'VN scene — character' : 'VN scene — background');
+        }
         if (img.setAsBackground && !isCharacter) {
             img.bgMap = img.bgMap ?? {};
             img.bgMap[chatKey()] = { url };
@@ -1692,6 +1821,7 @@ function buildSettings() {
         <div class="vnt-set-row">
             <label class="checkbox_label"><input id="vnt-set-img-attach" type="checkbox" ${img.attachToMessage ? 'checked' : ''}/> Attach to last message</label>
             <label class="checkbox_label"><input id="vnt-set-img-bg" type="checkbox" ${img.setAsBackground ? 'checked' : ''}/> Use as VN background</label>
+            <label class="checkbox_label"><input id="vnt-set-img-autotag" type="checkbox" ${img.autoFromTag ? 'checked' : ''}/> AI may auto-generate backgrounds (bggen tags)</label>
         </div>
         <div class="vnt-set-row">
             <label>Steps <input id="vnt-set-img-steps" type="number" value="${img.steps}" min="4" max="60" size="3"/></label>
@@ -1738,6 +1868,7 @@ function buildSettings() {
     imgSet('#vnt-set-img-url', e => { img.comfyUrl = e.target.value.trim() || DEFAULT_SETTINGS.image.comfyUrl; });
     imgSet('#vnt-set-img-attach', e => { img.attachToMessage = e.target.checked; });
     imgSet('#vnt-set-img-bg', e => { img.setAsBackground = e.target.checked; });
+    imgSet('#vnt-set-img-autotag', e => { img.autoFromTag = e.target.checked; });
     imgSet('#vnt-set-img-steps', e => { img.steps = Math.max(4, Math.min(60, Math.round(Number(e.target.value)) || 30)); });
     imgSet('#vnt-set-img-cfg', e => { img.cfg = Math.max(1, Math.min(12, Number(e.target.value) || 4)); });
     imgSet('#vnt-set-img-seed', e => { const n = Number(e.target.value); img.seed = Number.isFinite(n) ? Math.trunc(n) : -1; });
@@ -1800,6 +1931,26 @@ jQuery(() => {
         toggleDrawer,
         cycleEffect,
         genImage: generateSceneImage,
+        judgeRaw: async () => {
+            const ctx = getContext();
+            const chat = ctx.chat ?? [];
+            const charName = ctx.name2 || 'the character';
+            const userName = ctx.name1 || 'the user';
+            const from = Math.max(0, chat.length - 8);
+            const transcript = chat.slice(from).map(m =>
+                `${m.is_user ? userName : (m.name || charName)}: ${stripSceneTags(m.mes).slice(0, 600)}`).join('\n');
+            const st2 = getState();
+            try {
+                await requireApi();
+                const raw = await ctx.generateRaw({
+                    prompt: buildJudgePrompt(st2, transcript, charName, userName, 'No intent tag.'),
+                    systemPrompt: JSON_ONLY_SYSTEM,
+                });
+                return { ok: true, raw: String(raw ?? '').slice(0, 600) };
+            } catch (e) {
+                return { ok: false, error: String(e?.message ?? e).slice(0, 400) };
+            }
+        },
         translateNow: async () => {
             const mes = lastAiMessage();
             if (!mes) return '';
