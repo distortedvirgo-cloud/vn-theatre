@@ -168,6 +168,22 @@
     font-size: 1.02rem;
     line-height: 1.65;
     max-height: 34vh;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.35) transparent;
+}
+
+/* thin always-visible bar: on touch screens the native one is invisible */
+.vnt-text::-webkit-scrollbar {
+    width: 6px;
+}
+
+.vnt-text::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.vnt-text::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 3px;
 }
 
 /* scene image attached to the message, shown inside the VN reply */
@@ -450,7 +466,11 @@
     }
 
     .vnt-text {
-        max-height: 40vh;
+        max-height: 46vh;
+    }
+
+    .vnt-media-img {
+        max-height: 26vh;
     }
 
     .vnt-translation {

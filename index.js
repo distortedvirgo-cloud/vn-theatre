@@ -698,6 +698,10 @@ function buildOverlay() {
         ui.querySelector('.vnt-backlog').classList.add('vnt-hidden');
     });
     ui.querySelector('.vnt-act-state').addEventListener('click', () => toggleDrawer());
+    // reader scrolled up: freeze the bottom pin until they return to the end
+    ui.querySelector('.vnt-text').addEventListener('scroll', function () {
+        textStuck = this.scrollTop + this.clientHeight >= this.scrollHeight - 8;
+    });
     ui.querySelector('.vnt-act-translate').addEventListener('click', async () => {
         const mes = lastAiMessage();
         if (!mes) return;
@@ -889,6 +893,10 @@ function setBackground(key) {
     bgFlip = !bgFlip;
 }
 
+// the dialog auto-scrolls to the newest line only while the reader is at
+// the bottom; scrolling up freezes the pin so long replies stay readable
+let textStuck = true;
+
 function typewrite(target, text) {
     stopTypewriter();
     if (!getSettings().typewriter) {
@@ -899,6 +907,7 @@ function typewrite(target, text) {
     typeTimer = setInterval(() => {
         i += 2;
         target.textContent = text.slice(0, i);
+        if (textStuck) target.scrollTop = target.scrollHeight;
         if (i >= text.length) stopTypewriter();
     }, 18);
 }
@@ -987,20 +996,26 @@ function refresh() {
         const tr = cachedTranslation(last.id);
         // VN mode: the translation replaces the original inside the dialog
         // box; the language button toggles back to the original
-        if (vntPaintedMesId !== last.id) { vntToggleOriginal = false; vntPaintedMesId = last.id; }
+        if (vntPaintedMesId !== last.id) { vntToggleOriginal = false; vntPaintedMesId = last.id; textStuck = true; }
         const showOriginal = vntToggleOriginal || !tr;
         const body = fixQuoteRuns(showOriginal ? text : tr);
         // markdown (bold/italic) and HTML must be rendered, not shown raw:
-        // typewriter only for pure prose without any markup markers
+        // typewriter only for pure prose without any markup markers.
+        // repaint only when the painted content changes — setting innerHTML
+        // resets scrollTop and would snap the reader back to the bottom
         const hasMarkup = /[<>]|[*_`~]/.test(body);
-        if (hasMarkup || !s.typewriter) {
-            stopTypewriter();
-            tEl.innerHTML = messageFormatting(body, last.mes.name || chName || '', false, false, false);
-            tEl.scrollTop = tEl.scrollHeight;
-        } else {
-            typewrite(tEl, body);
+        const paintKey = `${last.id}|${showOriginal}|${body}`;
+        if (tEl.__vntPaint !== paintKey) {
+            tEl.__vntPaint = paintKey;
+            if (hasMarkup || !s.typewriter) {
+                stopTypewriter();
+                tEl.innerHTML = messageFormatting(body, last.mes.name || chName || '', false, false, false);
+                if (textStuck) tEl.scrollTop = tEl.scrollHeight;
+            } else {
+                typewrite(tEl, body);
+            }
+            styleSfx(tEl);
         }
-        styleSfx(tEl);
         // the separate translation strip under the text is retired — the
         // translation now lives in the dialog box itself
         const trEl = ui.querySelector('.vnt-translation');
