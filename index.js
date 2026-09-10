@@ -755,11 +755,14 @@ function lastAiMessage() {
     return null;
 }
 
-// doubled/tripled quote runs ("" ... """) sneak in when a model mirrors the
-// source's escaped quotes; clean on every read so stale cache entries and new
-// translations render identically
+// quote hygiene for everything the VN dialog paints: straight double quotes
+// everywhere — collapse doubled/tripled runs, drop escape backslashes and
+// unify guillemets/curly quotes (« » “ ” „) so dialogue quotes look uniform
 function fixQuoteRuns(s) {
-    return String(s ?? '').replace(/\\+(?=["'])/g, '').replace(/"{2,}/g, '"');
+    return String(s ?? '')
+        .replace(/\\+(?=["'])/g, '')
+        .replace(/[«»“”„]/g, '"')
+        .replace(/"{2,}/g, '"');
 }
 
 function cachedTranslation(id) {
@@ -918,7 +921,7 @@ function refresh() {
         // box; the language button toggles back to the original
         if (vntPaintedMesId !== last.id) { vntToggleOriginal = false; vntPaintedMesId = last.id; }
         const showOriginal = vntToggleOriginal || !tr;
-        const body = showOriginal ? text : tr;
+        const body = fixQuoteRuns(showOriginal ? text : tr);
         // markdown (bold/italic) and HTML must be rendered, not shown raw:
         // typewriter only for pure prose without any markup markers
         const hasMarkup = /[<>]|[*_`~]/.test(body);
