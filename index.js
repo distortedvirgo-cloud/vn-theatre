@@ -24,7 +24,7 @@ const DEFAULT_SETTINGS = {
     petals: true,            // legacy (kept for migration -> effect)
     sfx: true,               // comic-burst styling for ALL-CAPS onomatopoeia
     autoTranslate: true,
-    provider: 'llm',         // llm (user's chat API) | st-proxy | google | libre
+    provider: 'llm',         // translation goes through the chat LLM API only
     libreUrl: 'https://libretranslate.com/translate',
     libreKey: '',
     targetLang: 'ru',
@@ -78,6 +78,11 @@ function getSettings() {
         if (s.autoTranslate === false) s.autoTranslate = true;
         s.judgeFailed = false; // stale failure flag would hide new error toasts
         s.vnt_v13_migrated = true;
+    }
+    // migration v1.5.4: translation is LLM-only (google/proxy/libre dropped)
+    if (!s.vnt_llm_only_migrated) {
+        s.provider = 'llm';
+        s.vnt_llm_only_migrated = true;
     }
     return s;
 }
@@ -1688,8 +1693,8 @@ async function fetchTranslation(text) {
     const segs = splitTranslateSegments(stripped);
     // markup (VTK cards, tags) survives translation as ⟦N⟧ placeholders
     const { text: body, tokens } = protectHtml(stripped);
-    const chain = [s.provider, 'st-proxy', 'google', 'llm']
-        .filter((v, i, a) => a.indexOf(v) === i && TRANSLATORS[v]);
+    // LLM API only: the user opted out of google/proxy translation fallbacks
+    const chain = ['llm'];
     let out = '';
     let lastErr = null;
     for (const p of chain) {
@@ -2058,14 +2063,9 @@ function buildSettings() {
             <label>Target language <input id="vnt-set-lang" type="text" value="${esc(s.targetLang)}" size="6"/></label>
             <label>Provider
                 <select id="vnt-set-provider">
-                    <option value="st-proxy" ${s.provider === 'st-proxy' ? 'selected' : ''}>SillyTavern proxy (Google)</option>
-                    <option value="google" ${s.provider === 'google' ? 'selected' : ''}>Google (free)</option>
-                    <option value="libre" ${s.provider === 'libre' ? 'selected' : ''}>LibreTranslate</option>
-                    <option value="llm" ${s.provider === 'llm' ? 'selected' : ''}>LLM (current API)</option>
+                    <option value="llm" selected>LLM (current API)</option>
                 </select>
             </label>
-            <label>Libre URL <input id="vnt-set-libre" type="text" value="${esc(s.libreUrl)}" size="28"/></label>
-            <label>API key <input id="vnt-set-key" type="password" value="${esc(s.libreKey)}" size="12"/></label>
         </div>
         <div class="vnt-set-row">
             <label>Ambient effect
@@ -2121,8 +2121,6 @@ function buildSettings() {
     q('#vnt-set-sfx').addEventListener('change', e => { s.sfx = e.target.checked; saveSettingsDebounced(); });
     q('#vnt-set-lang').addEventListener('change', e => { s.targetLang = e.target.value.trim() || 'ru'; saveSettingsDebounced(); });
     q('#vnt-set-provider').addEventListener('change', e => { s.provider = e.target.value; saveSettingsDebounced(); });
-    q('#vnt-set-libre').addEventListener('change', e => { s.libreUrl = e.target.value.trim(); saveSettingsDebounced(); });
-    q('#vnt-set-key').addEventListener('change', e => { s.libreKey = e.target.value.trim(); saveSettingsDebounced(); });
     q('#vnt-set-bgs').addEventListener('change', e => { s.customBgs = e.target.value; saveSettingsDebounced(); refresh(); });
     q('#vnt-set-clear').addEventListener('click', () => { s.cache = {}; saveSettingsDebounced(); toastr.success('Translation cache cleared', 'VN Theatre'); });
     // effects
