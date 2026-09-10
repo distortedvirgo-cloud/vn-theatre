@@ -182,6 +182,18 @@ function chatKey() {
     return ctx.groupId ? `g:${ctx.groupId}` : `c:${ctx.chatId ?? 'none'}`;
 }
 
+// welcome-screen service messages (Assistant greeting + system panel) sit in
+// a pseudo-chat; translating/judging/chipping them wastes LLM calls and
+// caches junk under the c:none key
+const SERVICE_MSG_TYPES = new Set(['assistant_message', 'welcome_prompt']);
+function isServiceMessage(m) {
+    return !!m && (m.is_system === true || SERVICE_MSG_TYPES.has(String(m?.extra?.type ?? '')));
+}
+function isRoleplayChat() {
+    const chat = getContext().chat ?? [];
+    return chat.length >= 2 && !chat.some(isServiceMessage);
+}
+
 function getState() {
     const ctx = getContext();
     // preferred: per-chat metadata (saved with the chat file)
@@ -1716,7 +1728,7 @@ function putCache(id, t) {
 export async function translateMessage(id) {
     const chat = getContext().chat ?? [];
     const m = chat[id];
-    if (!m) return '';
+    if (!m || isServiceMessage(m)) return '';
     const t = await fetchTranslation(m.mes);
     putCache(id, t);
     return t;
@@ -1916,8 +1928,8 @@ async function generateSceneImage(sceneOverride = null) {
 
 function showTranslationUnderMessage(mesEl, id) {
     const t = cachedTranslation(id);
+    if (!t || isServiceMessage(getContext().chat?.[Number(id)])) { mesEl.querySelector('.vn-translation')?.remove(); return; }
     let box = mesEl.querySelector('.vn-translation');
-    if (!t) { box?.remove(); return; }
     if (!box) {
         box = el('div', 'vn-translation');
         mesEl.querySelector('.mes_text')?.after(box);
@@ -1977,6 +1989,8 @@ function decorateAllMessages() {
 function bindEvents() {
     eventSource.on(event_types.MESSAGE_RECEIVED, (id) => {
         refresh();
+        // welcome screen pushes its greeting/panel through addOneMessage too
+        if (isServiceMessage(getContext().chat?.[Number(id)])) return;
         const last = lastAiMessage();
         decorateMessage(last?.id ?? -1);
         if (getSettings().autoTranslate && last) {
@@ -2018,8 +2032,8 @@ function bindEvents() {
             renderChips(document.querySelector('.vnt-chips'));
             // wait out the chat load, then read the actual scene
             setTimeout(() => {
-                if (s.autoChoices && (getContext().chat ?? []).length >= 2) generateChoices();
-                repairLastTranslation();
+                if (s.autoChoices && isRoleplayChat()) generateChoices();
+                if (isRoleplayChat()) repairLastTranslation();
             }, 1000);
         }, 300);
     });
@@ -2183,12 +2197,11 @@ jQuery(() => {
     // situation the player returns to (stale options from another chat go first)
     setTimeout(() => {
         const s = getSettings();
-        const chat = getContext().chat ?? [];
-        if (s.enabled && s.autoChoices && chat.length >= 2) {
+        if (s.enabled && s.autoChoices && isRoleplayChat()) {
             s.chipOptions = [];
             generateChoices();
         }
-        if (s.enabled) repairLastTranslation();
+        if (s.enabled && isRoleplayChat()) repairLastTranslation();
     }, 3000);
     // debug/testing hook
     window.__vnt = {
