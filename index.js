@@ -755,9 +755,16 @@ function lastAiMessage() {
     return null;
 }
 
+// doubled/tripled quote runs ("" ... """) sneak in when a model mirrors the
+// source's escaped quotes; clean on every read so stale cache entries and new
+// translations render identically
+function fixQuoteRuns(s) {
+    return String(s ?? '').replace(/\\+(?=["'])/g, '').replace(/"{2,}/g, '"');
+}
+
 function cachedTranslation(id) {
     const s = getSettings();
-    return s.cache[chatKey()]?.[String(id)]?.t ?? '';
+    return fixQuoteRuns(s.cache[chatKey()]?.[String(id)]?.t ?? '');
 }
 
 function setSprite(url) {
@@ -1471,10 +1478,10 @@ async function translateViaLibre(body, lang) {
 async function translateViaLlm(body, lang) {
     const ctx = getContext();
     await requireApi();
-    const prompt = `Translate the following roleplay message into ${lang}. Reply with ONLY the translation — same tone, no comments, no quotes. Keep the markdown formatting (**bold**, *italic*, quotes) and line breaks intact:\n\n${body}`;
+    const prompt = `Translate the following roleplay message into ${lang}. Reply with ONLY the translation — same tone, no comments, no quotes. Keep the markdown formatting (**bold**, *italic*) and line breaks intact. Reproduce the source's quotation marks exactly as they appear — never add, duplicate or escape them:\n\n${body}`;
     return String(await ctx.generateRaw({
         prompt,
-        systemPrompt: 'You are a translation engine. Reply with only the translated text — nothing else.',
+        systemPrompt: 'You are a translation engine. Reply with only the translated text — nothing else. Never add or double quotation marks.',
     }) ?? '').trim();
 }
 
@@ -1487,7 +1494,10 @@ const TRANSLATORS = {
 
 async function fetchTranslation(text) {
     const s = getSettings();
+    // some instruct presets emit escaped quotes (\"...\"); feed the
+    // translator clean prose or it mirrors the backslashes as extra quotes
     const stripped = stripSceneTags(text)
+        .replace(/\\+(?=["'])/g, '')
         .replace(/<!--[\s\S]*?-->/g, '')
         .trim();
     if (!stripped) return '';
@@ -1505,6 +1515,9 @@ async function fetchTranslation(text) {
     }
     out = String(out ?? '').trim();
     if (!out) throw lastErr ?? new Error('all translation providers failed');
+    // models sometimes mirror the source's quotes as doubled/tripled runs
+    // (tokens hide HTML attributes, so bare prose is safe to collapse)
+    out = fixQuoteRuns(out);
     return restoreHtml(out, tokens).trim();
 }
 
