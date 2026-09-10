@@ -54,7 +54,7 @@ const DEFAULT_SETTINGS = {
         lora: 'iw178.safetensors',
         loraStrength: 1.0,
         loraTrigger: '@iw178',
-        steps: 30,
+        steps: 10,              // 10 steps ≈ 9s on RTX 5060 Ti — quality close to 30
         cfg: 4,
         seed: -1,
         maxDim: 1280,           // longest side after downscale
@@ -2523,7 +2523,7 @@ function buildSettings() {
     imgSet('#vnt-set-img-attach', e => { img.attachToMessage = e.target.checked; });
     imgSet('#vnt-set-img-bg', e => { img.setAsBackground = e.target.checked; });
     imgSet('#vnt-set-img-autotag', e => { img.autoFromTag = e.target.checked; });
-    imgSet('#vnt-set-img-steps', e => { img.steps = Math.max(4, Math.min(60, Math.round(Number(e.target.value)) || 30)); });
+    imgSet('#vnt-set-img-steps', e => { img.steps = Math.max(4, Math.min(60, Math.round(Number(e.target.value)) || 10)); });
     imgSet('#vnt-set-img-cfg', e => { img.cfg = Math.max(1, Math.min(12, Number(e.target.value) || 4)); });
     imgSet('#vnt-set-img-seed', e => { const n = Number(e.target.value); img.seed = Number.isFinite(n) ? Math.trunc(n) : -1; });
     imgSet('#vnt-set-img-maxdim', e => { img.maxDim = Math.max(512, Math.min(2048, Math.round(Number(e.target.value)) || 1280)); });
