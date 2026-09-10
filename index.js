@@ -51,8 +51,9 @@ const DEFAULT_SETTINGS = {
         qualityTags: 'masterpiece, best quality, highly detailed',
         negativePrompt: 'lowres, bad anatomy, bad hands, watermark, signature, text',
         checkpoint: '',        // anima default: anima-base-v1.0.safetensors; sdxl: set your checkpoint
-        lora: '',
+        lora: 'iw178.safetensors',
         loraStrength: 1.0,
+        loraTrigger: '@iw178',
         steps: 30,
         cfg: 4,
         seed: -1,
@@ -95,6 +96,13 @@ function imgSettings() {
     if (!s.image || typeof s.image !== 'object') s.image = JSON.parse(JSON.stringify(DEFAULT_SETTINGS.image));
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS.image)) {
         if (s.image[k] === undefined) s.image[k] = v;
+    }
+    // migration: user request — style LoRA iw178 with the @iw178 trigger on
+    // every generation; a custom LoRA set later in settings wins
+    if (!s.image.loraIw178Migrated) {
+        if (!String(s.image.lora ?? '').trim()) s.image.lora = 'iw178.safetensors';
+        s.image.loraTrigger = s.image.loraTrigger ?? '@iw178';
+        s.image.loraIw178Migrated = true;
     }
     return s.image;
 }
@@ -895,16 +903,19 @@ function renderCast(speakerName, expr) {
     if (!cast) return;
     const img = imgSettings();
     const slots = CAST_POSITIONS[Math.min(castNames.length, 4)] ?? [];
-    const ready = castNames.map(name => img.spriteMap?.[name]?.url).filter(Boolean);
     cast.innerHTML = castNames.map((name, i) => {
-        const url = img.spriteMap?.[name]?.url;
+        const entry = img.spriteMap?.[name];
+        const sprites = entry?.sprites ?? {};
+        // the scene's emotion picks the variant; anything ready beats nothing
+        const url = sprites[spriteEmotionKey(expr)] ?? sprites.neutral ?? Object.values(sprites)[0] ?? '';
         if (!url) return '';
         const isSpeaker = String(name).toLowerCase() === String(speakerName ?? '').toLowerCase();
         const filter = (isSpeaker ? exprFilter(expr) : 'brightness(0.55) saturate(0.8)');
         return `<div class="vnt-cast-slot ${isSpeaker ? 'vnt-cast-active' : ''}" style="left:${slots[i] ?? 50}%">` +
             `<img src="${esc(url)}" style="filter:${filter}" alt="${esc(name)}" title="${esc(name)}"></div>`;
     }).join('');
-    cast.classList.toggle('vnt-hidden', !ready.length);
+    // empty slots render '', so any img left in the DOM means a visible cast
+    cast.classList.toggle('vnt-hidden', !cast.querySelector('img'));
 }
 
 function setCG(url) {
@@ -1089,10 +1100,13 @@ function refresh() {
         if (!cgOn) renderCast(last.mes.name || chName, expr);
         // remember scene in state
         let sceneChanged = false;
+        let outfitChanged = false;
         if (scene.background && scene.background !== st.scene.background) { st.scene.background = scene.background; sceneChanged = true; }
         if (scene.mood && scene.mood !== st.scene.mood) { st.scene.mood = scene.mood; sceneChanged = true; }
-        if (scene.outfit && scene.outfit !== st.outfit.char) { st.outfit.char = scene.outfit; sceneChanged = true; }
+        if (scene.outfit && scene.outfit !== st.outfit.char) { st.outfit.char = scene.outfit; sceneChanged = true; outfitChanged = true; }
         if (sceneChanged) { persistState(); }
+        // new outfit → the emotion sprite set is stale; repaint it in place
+        if (outfitChanged) invalidateOutfitSprites();
         // AI-driven ambience: the model's tag switches the particle effect...
         if (scene.effect && EFFECT_PRESETS.includes(scene.effect) && scene.effect !== s.effect) {
             s.effect = scene.effect;
@@ -2026,7 +2040,9 @@ function animaPrompt(scenePrompt, safety) {
     return joinTags([base, 'anime style, 2d anime illustration, cel shaded']);
 }
 
-// one ComfyUI run: Anima t2i (+ optional RMBG for sprites) → saved file URL
+// one ComfyUI run: Anima t2i (+ optional RMBG for sprites) → saved file URL.
+// The style LoRA trigger tag leads every prompt; the LoRA itself loads in
+// the workflow's LoraLoaderModelOnly node.
 async function paintScene({ prompt, negative, ratio, sprite = false }) {
     const img = imgSettings();
     const engine = img.preset === 'sdxl' ? 'sdxl' : 'anima';
@@ -2034,8 +2050,10 @@ async function paintScene({ prompt, negative, ratio, sprite = false }) {
     const workflowText = await loadBundledWorkflow(wfName);
     const { width, height } = getResolutionForRatio(ratio, 1024);
     const seed = img.seed >= 0 ? img.seed : Math.floor(Math.random() * 2 ** 48);
+    const trigger = String(img.loraTrigger ?? '').trim();
+    const fullPrompt = trigger ? `${trigger}, ${prompt}` : prompt;
     const workflow = substituteWorkflow(workflowText, {
-        prompt, negative, width, height, seed,
+        prompt: fullPrompt, negative, width, height, seed,
         steps: img.steps, cfg: img.cfg,
         model: img.checkpoint || (engine === 'anima' ? 'anima-base-v1.0.safetensors' : ''),
         denoise: 1.0,
@@ -2066,42 +2084,97 @@ function syncCast(cast) {
         .slice(0, 4);
     castNames = list;
     for (const name of castNames) {
-        if (!img.spriteMap[name]?.url) ensureSprite(name);
+        for (const v of EMOTION_VARIANTS) ensureSprite(name, v.key);
     }
     if (getSettings().enabled) refresh();
 }
 
 // sprite generations run strictly one at a time: chained promises keep
 // ComfyUI from stampeding when the director drops a whole cast at once
-function ensureSprite(name) {
-    if (spritePending.has(name)) return;
-    spritePending.add(name);
+function ensureSprite(name, key = 'neutral') {
+    const vkey = `${name}|${key}`;
+    if (spritePending.has(vkey)) return;
+    const entry = spriteEntry(name);
+    if (entry.sprites[key]) return;
+    spritePending.add(vkey);
     spriteChain = spriteChain
-        .then(() => genSprite(name))
-        .catch(e => toastr.error(`${name} sprite failed: ${String(e?.message ?? e).slice(0, 120)}`, 'VN Theatre'))
-        .finally(() => spritePending.delete(name));
+        .then(() => genSpriteVariant(name, key))
+        .catch(e => toastr.error(`${name} sprite (${key}) failed: ${String(e?.message ?? e).slice(0, 110)}`, 'VN Theatre'))
+        .finally(() => spritePending.delete(vkey));
 }
 
-async function genSprite(name) {
+// one spriteMap record per character: reusable signature tags + current
+// outfit + the emotion variant set; legacy {url, tags} entries migrate here
+function spriteEntry(name) {
     const img = imgSettings();
     img.spriteMap = img.spriteMap ?? {};
-    updateFxPill(`VN Theatre: painting ${name}…`);
-    const tags = img.spriteMap[name]?.tags ?? await extractSignature(name);
+    let e = img.spriteMap[name];
+    if (!e || typeof e !== 'object') e = img.spriteMap[name] = { tags: '', outfit: '', sprites: {} };
+    if (e.url) { e.sprites = { neutral: e.url }; delete e.url; }
+    e.sprites = e.sprites ?? {};
+    e.outfit = e.outfit ?? '';
+    e.tags = e.tags ?? '';
+    return e;
+}
+
+// emotion variants: same character, four reusable poses/expressions; the
+// scene's expression picks the active one until the outfit changes
+const EMOTION_VARIANTS = [
+    { key: 'neutral', tags: 'relaxed neutral pose, calm neutral expression' },
+    { key: 'happy', tags: 'cheerful happy smile, bright eyes, one hand raised in a friendly wave' },
+    { key: 'angry', tags: 'furious glare, furrowed brows, arms crossed, tense posture' },
+    { key: 'shy', tags: 'shy blushing expression, eyes averted, hands clasped together' },
+];
+
+function spriteEmotionKey(expr) {
+    switch (expr) {
+        case 'happy': case 'love': return 'happy';
+        case 'angry': return 'angry';
+        case 'shy': case 'sad': case 'sleepy': return 'shy';
+        default: return 'neutral';
+    }
+}
+
+async function genSpriteVariant(name, key) {
+    const img = imgSettings();
+    const variant = EMOTION_VARIANTS.find(v => v.key === key) ?? EMOTION_VARIANTS[0];
+    const entry = spriteEntry(name);
+    if (entry.sprites[key]) return; // regenerated meanwhile
+    updateFxPill(`VN Theatre: painting ${name} (${key})…`);
+    if (!entry.tags) entry.tags = await extractSignature(name);
+    const outfit = (getState().outfit.char ?? '').replace(/_/g, ' ').replace(/-/g, ' ').trim();
     // waist-up framing: the figure reads at dialogue distance, VN-style
-    const prompt = joinTags(['masterpiece, best quality, score_7, safe, solo', tags,
+    const prompt = joinTags(['masterpiece, best quality, score_7, safe, solo', entry.tags,
+        outfit ? `wearing ${outfit}` : '',
         'upper body, waist-up framing, medium close shot, simple background',
+        variant.tags,
         'anime style, 2d anime illustration, cel shaded']) +
-        `. ${name} faces the viewer from the waist up in a relaxed neutral pose, head and torso centered in the frame, clean readable silhouette, soft even lighting, anime illustration.`;
+        `. ${name} faces the viewer from the waist up, head and torso centered in the frame, clean readable silhouette, soft even lighting, anime illustration.`;
     const url = await paintScene({
         prompt,
         negative: 'realistic, photorealistic, photo, 3d render, multiple views, split screen, cropped, out of frame, full body, feet',
         ratio: '3:4',
         sprite: true,
     });
-    img.spriteMap[name] = { url, tags };
+    entry.sprites[key] = url;
+    entry.outfit = getState().outfit.char ?? '';
     saveSettingsDebounced();
     if (getSettings().enabled) refresh();
-    toastr.success(`${name} joined the stage`, 'VN Theatre');
+    toastr.success(`${name} (${key}) joined the stage`, 'VN Theatre');
+}
+
+// outfit changed: the whole variant set is stale — drop and requeue
+function invalidateOutfitSprites() {
+    const img = imgSettings();
+    if (!img.enabled) return;
+    const outfit = getState().outfit.char ?? '';
+    for (const name of castNames) {
+        const entry = img.spriteMap?.[name];
+        if (!entry || entry.outfit === outfit) continue;
+        entry.outfit = outfit;
+        entry.sprites = {};
+        for (const v of EMOTION_VARIANTS) ensureSprite(name, v.key);
+    }
 }
 
 // reusable visual signature block: LLM distills the card + story once per
