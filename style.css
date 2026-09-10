@@ -170,6 +170,20 @@
     max-height: 34vh;
 }
 
+/* scene image attached to the message, shown inside the VN reply */
+.vnt-media-box {
+    flex: 0 0 auto;
+}
+
+.vnt-media-img {
+    display: block;
+    width: 100%;
+    max-height: 34vh;
+    object-fit: contain;
+    border-radius: 10px;
+    margin-bottom: 6px;
+}
+
 .vnt-text * {
     max-width: 100%;
 }

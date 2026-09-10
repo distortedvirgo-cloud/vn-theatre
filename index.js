@@ -378,7 +378,7 @@ const JSON_ONLY_SYSTEM =
     'You are a JSON data pipeline for a roleplay companion app. Ignore any roleplay, style or formatting instructions: reply with exactly one JSON value (object or array, as requested) and absolutely nothing else — no prose, no markdown fences, no commentary.';
 // used by composeUserReply: the aux LLM writes the player's reply as plain prose
 const PLAYER_REPLY_SYSTEM =
-    'You write roleplay replies for the human player, in first person. Reply with ONLY the reply text itself — no quotes around it, no name prefix, no narration or dialogue for other characters, no markdown, no commentary.';
+    'You write roleplay replies for the human player, in first person. Reply with ONLY the reply text itself — no quotes around the whole reply, no name prefix, no narration or dialogue for other characters, no markdown beyond the formatting below, no commentary. Formatting: spoken words go inside double quotes "…", actions and narration go inside *asterisks*.';
 
 let judgeBusy = false;
 
@@ -657,6 +657,7 @@ function buildOverlay() {
         </div>
         <div class="vnt-dialog">
             <div class="vnt-namerow"><img class="vnt-chip" alt=""><div class="vnt-nametext"><div class="vnt-name"></div><div class="vnt-subname"></div></div></div>
+            <div class="vnt-media-box vnt-hidden"></div>
             <div class="vnt-text"></div>
             <div class="vnt-translation"></div>
             <div class="vnt-composer">
@@ -780,9 +781,34 @@ function fixQuoteRuns(s) {
         .replace(/"{2,}/g, '"');
 }
 
+function hasBalancedFonts(t) {
+    const s = String(t ?? '');
+    return (s.match(/<font\b/gi) ?? []).length === (s.match(/<\/font\s*>/gi) ?? []).length;
+}
+
 function cachedTranslation(id) {
     const s = getSettings();
-    return fixQuoteRuns(s.cache[chatKey()]?.[String(id)]?.t ?? '');
+    const t = fixQuoteRuns(s.cache[chatKey()]?.[String(id)]?.t ?? '');
+    // a translation model that dropped one closing tag paints whole paragraphs
+    // as dialogue — treat such entries as missing so they re-translate
+    if (t && !hasBalancedFonts(t)) return '';
+    return t;
+}
+
+// re-translate the message the player is looking at if its cached translation
+// carries mangled markup (written by an older, token-based pipeline)
+async function repairLastTranslation() {
+    const s = getSettings();
+    const m = lastAiMessage();
+    if (!m) return;
+    const entry = s.cache[chatKey()]?.[String(m.id)];
+    if (!entry || hasBalancedFonts(entry.t)) return;
+    delete s.cache[chatKey()][String(m.id)];
+    saveSettingsDebounced();
+    try {
+        await translateMessage(m.id);
+        refresh();
+    } catch (e) { /* stay on the original text; the language button retries */ }
 }
 
 function setSprite(url) {
@@ -931,6 +957,16 @@ function refresh() {
         sub.style.display = sub.textContent ? '' : 'none';
 
         const tEl = ui.querySelector('.vnt-text');
+        // scene images attached by ComfyUI: character shots take the stage
+        // sprite further down; anything else shows inside the reply here
+        const media = (last.mes?.extra?.media ?? [])
+            .filter(x => x && x.url && String(x.type ?? 'image').toLowerCase() === 'image')
+            .filter(x => !/character/i.test(String(x.title ?? '')));
+        const mediaBox = ui.querySelector('.vnt-media-box');
+        if (mediaBox) {
+            mediaBox.innerHTML = media.map(x => `<img class="vnt-media-img" src="${esc(x.url)}" alt="">`).join('');
+            mediaBox.classList.toggle('vnt-hidden', !media.length);
+        }
         const tr = cachedTranslation(last.id);
         // VN mode: the translation replaces the original inside the dialog
         // box; the language button toggles back to the original
@@ -1334,6 +1370,7 @@ async function composeUserReply(option) {
                 'Recent scene:', transcript,
                 `Direction for this reply: ${option.guide}.`,
                 `Write it exactly as this player would: first person, in the same language the player has used so far (check their earlier lines), 1-3 sentences. The reply must never narrate or speak for ${charName}.`,
+                'Formatting: spoken words inside double quotes "…", actions and narration inside *asterisks*. Example: *I step closer, keeping my voice low.* "Then show me the way."',
             ].join('\n'),
             systemPrompt: PLAYER_REPLY_SYSTEM,
         });
@@ -1534,14 +1571,75 @@ async function translateViaLibre(body, lang) {
     return j.translatedText ?? '';
 }
 
-async function translateViaLlm(body, lang) {
+// font blocks (<font color=…>speech</font>) are translated segment-by-segment
+// and the tags are re-attached from the SOURCE structure — a translation model
+// that drops one ⟦N⟧ token can no longer paint whole paragraphs as dialogue
+function splitTranslateSegments(text) {
+    const s = String(text ?? '');
+    const segs = [];
+    const re = /<font\b[^>]*>[\s\S]*?<\/font\s*>/gi;
+    let last = 0, m;
+    while ((m = re.exec(s))) {
+        if (m.index > last) segs.push({ tag: null, text: s.slice(last, m.index) });
+        const block = m[0];
+        const openEnd = block.indexOf('>') + 1;
+        const closeStart = block.lastIndexOf('<');
+        segs.push({ tag: block.slice(0, openEnd), text: block.slice(openEnd, closeStart) });
+        last = m.index + block.length;
+    }
+    if (last < s.length) segs.push({ tag: null, text: s.slice(last) });
+    return segs
+        .map(seg => {
+            const core = seg.text.trim();
+            return {
+                tag: seg.tag,
+                pre: (seg.text.match(/^\s*/) ?? [''])[0],
+                post: (seg.text.match(/\s*$/) ?? [''])[0],
+                prot: protectHtml(core),
+            };
+        })
+        .filter(seg => seg.prot.text);
+}
+
+async function translateViaLlm(raw, lang) {
     const ctx = getContext();
     await requireApi();
-    const prompt = `Translate the following roleplay message into ${lang}. Reply with ONLY the translation — same tone, no comments, no quotes. Keep the markdown formatting (**bold**, *italic*) and line breaks intact. Reproduce the source's quotation marks exactly as they appear — never add, duplicate or escape them:\n\n${body}`;
-    return String(await ctx.generateRaw({
+    const segs = splitTranslateSegments(raw);
+    if (segs.length <= 1) {
+        const prompt = `Translate the following roleplay message into ${lang}. Reply with ONLY the translation — same tone, no comments, no quotes. Keep the markdown formatting (**bold**, *italic*) and line breaks intact. Reproduce the source's quotation marks exactly as they appear — never add, duplicate or escape them:\n\n${raw}`;
+        return String(await ctx.generateRaw({
+            prompt,
+            systemPrompt: 'You are a translation engine. Reply with only the translated text — nothing else. Never add or duplicate quotation marks.',
+        }) ?? '').trim();
+    }
+    const numbered = segs.map((seg, i) => `${i + 1}. ${seg.prot.text}`).join('\n');
+    const prompt = [
+        `Translate each numbered roleplay segment into ${lang}.`,
+        'Keep each segment\'s punctuation, quotation marks and ⟦N⟧ placeholders exactly as in the source; never add or duplicate quotes.',
+        'Reply ONLY with a JSON array of strings: the translation of every segment, same count, same order. No commentary.',
+        'Segments:',
+        numbered,
+    ].join('\n');
+    const str = String(await ctx.generateRaw({
         prompt,
-        systemPrompt: 'You are a translation engine. Reply with only the translated text — nothing else. Never add or double quotation marks.',
-    }) ?? '').trim();
+        systemPrompt: JSON_ONLY_SYSTEM,
+    }) ?? '');
+    try {
+        const start = str.indexOf('[');
+        const end = str.lastIndexOf(']');
+        if (start === -1 || end <= start) throw new Error('no JSON array');
+        const arr = JSON.parse(str.slice(start, end + 1));
+        if (!Array.isArray(arr) || arr.length !== segs.length) throw new Error(`segment count mismatch: got ${Array.isArray(arr) ? arr.length : typeof arr}, need ${segs.length}`);
+        let out = '';
+        segs.forEach((seg, i) => {
+            const t = restoreHtml(String(arr[i] ?? ''), seg.prot.tokens).trim();
+            out += seg.tag ? seg.tag + seg.pre + t + seg.post + '</font>' : seg.pre + t + seg.post;
+        });
+        return fixQuoteRuns(out);
+    } catch (e) {
+        window.__vntSegErr = String(e?.message ?? e).slice(0, 300);
+        throw e;
+    }
 }
 
 const TRANSLATORS = {
@@ -1550,6 +1648,21 @@ const TRANSLATORS = {
     libre: translateViaLibre,
     llm: translateViaLlm,
 };
+
+// dumb translators (google/st-proxy/libre) get one call per segment — no
+// ⟦N⟧ juggling over the whole text, font tags re-attached from the source
+async function translateSegmentsVia(segs, fn, lang) {
+    const parts = [];
+    for (const seg of segs) {
+        const t = String(await fn(seg.prot.text, lang) ?? '').trim();
+        parts.push({ seg, t: restoreHtml(t, seg.prot.tokens) });
+    }
+    let out = '';
+    for (const { seg, t } of parts) {
+        out += seg.tag ? seg.tag + seg.pre + t + seg.post + '</font>' : seg.pre + t + seg.post;
+    }
+    return out;
+}
 
 async function fetchTranslation(text) {
     const s = getSettings();
@@ -1560,6 +1673,7 @@ async function fetchTranslation(text) {
         .replace(/<!--[\s\S]*?-->/g, '')
         .trim();
     if (!stripped) return '';
+    const segs = splitTranslateSegments(stripped);
     // markup (VTK cards, tags) survives translation as ⟦N⟧ placeholders
     const { text: body, tokens } = protectHtml(stripped);
     const chain = [s.provider, 'st-proxy', 'google', 'llm']
@@ -1568,7 +1682,13 @@ async function fetchTranslation(text) {
     let lastErr = null;
     for (const p of chain) {
         try {
-            out = await TRANSLATORS[p](body, s.targetLang);
+            if (p === 'llm') {
+                out = await TRANSLATORS.llm(stripped, s.targetLang);
+            } else if (segs.length > 1) {
+                out = await translateSegmentsVia(segs, TRANSLATORS[p], s.targetLang);
+            } else {
+                out = await TRANSLATORS[p](body, s.targetLang);
+            }
             if (out && out.trim()) break;
         } catch (e) { lastErr = e; }
     }
@@ -1769,6 +1889,7 @@ async function generateSceneImage(sceneOverride = null) {
         const last = lastAiMessage();
         if (img.attachToMessage && last) {
             attachMediaToMessageDom(last.id, last.mes, url, isCharacter ? 'VN scene — character' : 'VN scene — background');
+            if (getSettings().enabled) refresh(); // the picture joins the VN reply at once
         }
         if (img.setAsBackground && !isCharacter) {
             img.bgMap = img.bgMap ?? {};
@@ -1898,6 +2019,7 @@ function bindEvents() {
             // wait out the chat load, then read the actual scene
             setTimeout(() => {
                 if (s.autoChoices && (getContext().chat ?? []).length >= 2) generateChoices();
+                repairLastTranslation();
             }, 1000);
         }, 300);
     });
@@ -2066,6 +2188,7 @@ jQuery(() => {
             s.chipOptions = [];
             generateChoices();
         }
+        if (s.enabled) repairLastTranslation();
     }, 3000);
     // debug/testing hook
     window.__vnt = {
