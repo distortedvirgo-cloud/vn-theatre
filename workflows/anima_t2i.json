@@ -26,7 +26,7 @@
         "2",
         0
       ],
-      "text": "masterpiece, best quality, sharp focus\n%prompt%"
+      "text": "%prompt%"
     }
   },
   "5": {

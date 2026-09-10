@@ -57,6 +57,9 @@ const DEFAULT_SETTINGS = {
         cfg: 4,
         seed: -1,
         maxDim: 1280,           // longest side after downscale
+        autoDirector: true,     // stage director runs after every AI reply
+        spriteMap: {},          // character name -> { url, tags } transparent sprite
+        cgMap: {},              // chatKey -> { url, mesId } key-scene full art
         bgMap: {},              // chatKey -> { url } generated VN background
     },
 };
@@ -642,9 +645,44 @@ function bgUrl(key) {
 
 let ui = null;
 let bgFlip = false;
-let spriteFlip = false;
 let typeTimer = null;
 let effectRAF = null;
+
+// --- dialog playback: the reply is shown line by line, click advances ---
+// speech segments keep the nameplate visible, action ones hide it; when the
+// last line is done the composer/chips appear — the player's turn
+let playMesId = -1;
+let playSeg = 0;
+let playSegs = [];
+let playCurText = '';
+let playCurKey = '';
+
+function splitPlaybackSegments(html) {
+    const segs = [];
+    const re = /<font\b[^>]*>([\s\S]*?)<\/font\s*>/gi;
+    let last = 0, m;
+    while ((m = re.exec(html))) {
+        const pre = html.slice(last, m.index);
+        if (pre.trim()) segs.push({ type: 'action', text: pre.trim() });
+        if (m[1].trim()) segs.push({ type: 'speech', text: m[1].trim() });
+        last = m.index + m[0].length;
+    }
+    const tail = html.slice(last);
+    if (tail.trim()) segs.push({ type: 'action', text: tail.trim() });
+    return segs;
+}
+
+function skipTypewriter() {
+    if (!typeTimer) return false;
+    stopTypewriter();
+    const tEl = ui?.querySelector('.vnt-text');
+    if (tEl) {
+        tEl.textContent = playCurText;
+        tEl.__vntPaint = playCurKey;
+        styleSfx(tEl);
+    }
+    return true;
+}
 
 function buildOverlay() {
     ui = el('div');
@@ -656,7 +694,8 @@ function buildOverlay() {
             <div class="vnt-shade"></div>
             <canvas class="vnt-petals"></canvas>
         </div>
-        <div class="vnt-sprite"><img class="vnt-sprite-a" alt=""><img class="vnt-sprite-b" alt=""></div>
+        <div class="vnt-cg vnt-hidden"><img alt=""></div>
+        <div class="vnt-cast"></div>
         <div class="vnt-topbar">
             <button class="vnt-btn vnt-act-backlog" title="Backlog"><i class="fa-solid fa-clock-rotate-left"></i></button>
             <button class="vnt-btn vnt-act-state" title="Relationship & scene state"><i class="fa-solid fa-heart-circle-check"></i></button>
@@ -676,6 +715,7 @@ function buildOverlay() {
             <div class="vnt-namerow"><img class="vnt-chip" alt=""><div class="vnt-nametext"><div class="vnt-name"></div><div class="vnt-subname"></div></div></div>
             <div class="vnt-media-box vnt-hidden"></div>
             <div class="vnt-text"></div>
+            <div class="vnt-advance vnt-hidden">▶</div>
             <div class="vnt-translation"></div>
             <div class="vnt-composer">
                 <div class="vnt-chips"></div>
@@ -701,6 +741,13 @@ function buildOverlay() {
     // reader scrolled up: freeze the bottom pin until they return to the end
     ui.querySelector('.vnt-text').addEventListener('scroll', function () {
         textStuck = this.scrollTop + this.clientHeight >= this.scrollHeight - 8;
+    });
+    // classic VN interaction: a click anywhere advances the reply line by
+    // line; buttons/input/drawer keep their own handlers
+    ui.addEventListener('click', (e) => {
+        if (e.target.closest('button, input, textarea, select, a, .vnt-drawer, .vnt-chips, .vnt-topbar, .vnt-backlog')) return;
+        if (skipTypewriter()) return;
+        if (playSeg < playSegs.length - 1) { playSeg++; refresh(); }
     });
     ui.querySelector('.vnt-act-translate').addEventListener('click', async () => {
         const mes = lastAiMessage();
@@ -832,36 +879,42 @@ async function repairLastTranslation() {
     } catch (e) { /* stay on the original text; the language button retries */ }
 }
 
-function setSprite(url) {
-    const a = ui.querySelector('.vnt-sprite-a');
-    const b = ui.querySelector('.vnt-sprite-b');
-    const chip = ui.querySelector('.vnt-chip');
-    if (!url) {
-        a.removeAttribute('src'); b.removeAttribute('src');
-        chip.removeAttribute('src');
-        return;
-    }
-    const probe = new Image();
-    probe.onload = () => {
-        if (probe.naturalWidth >= 256 && probe.naturalHeight >= 256) {
-            const front = spriteFlip ? a : b;
-            const back = spriteFlip ? b : a;
-            if (front.getAttribute('src') === url) { chip.src = url; return; }
-            back.onload = () => {
-                back.classList.add('vnt-in');
-                front.classList.remove('vnt-in');
-                spriteFlip = !spriteFlip;
-            };
-            back.src = url;
-            ui.querySelector('.vnt-sprite').classList.remove('vnt-chip-mode');
-        } else {
-            a.classList.remove('vnt-in');
-            b.classList.remove('vnt-in');
-            ui.querySelector('.vnt-sprite').classList.add('vnt-chip-mode');
-        }
-        chip.src = url;
-    };
-    probe.src = url;
+// stage cast: who is in the scene right now and where they stand.
+// Sprites are transparent PNGs (ComfyUI RMBG) cached per character name.
+let castNames = [];       // current cast, director-ordered
+let cgActive = false;     // key-scene CG currently replaces the cast
+const CAST_POSITIONS = {
+    1: [50],
+    2: [28, 72],
+    3: [18, 50, 82],
+    4: [12, 38, 62, 88],
+};
+
+function renderCast(speakerName, expr) {
+    const cast = ui.querySelector('.vnt-cast');
+    if (!cast) return;
+    const img = imgSettings();
+    const slots = CAST_POSITIONS[Math.min(castNames.length, 4)] ?? [];
+    const ready = castNames.map(name => img.spriteMap?.[name]?.url).filter(Boolean);
+    cast.innerHTML = castNames.map((name, i) => {
+        const url = img.spriteMap?.[name]?.url;
+        if (!url) return '';
+        const isSpeaker = String(name).toLowerCase() === String(speakerName ?? '').toLowerCase();
+        const filter = (isSpeaker ? exprFilter(expr) : 'brightness(0.55) saturate(0.8)');
+        return `<div class="vnt-cast-slot ${isSpeaker ? 'vnt-cast-active' : ''}" style="left:${slots[i] ?? 50}%">` +
+            `<img src="${esc(url)}" style="filter:${filter}" alt="${esc(name)}" title="${esc(name)}"></div>`;
+    }).join('');
+    cast.classList.toggle('vnt-hidden', !ready.length);
+}
+
+function setCG(url) {
+    const box = ui.querySelector('.vnt-cg');
+    const img = box?.querySelector('img');
+    if (!box || !img) return;
+    if (!url) { box.classList.add('vnt-hidden'); img.removeAttribute('src'); return; }
+    if (img.getAttribute('src') === url) { box.classList.remove('vnt-hidden'); return; }
+    img.onload = () => box.classList.remove('vnt-hidden');
+    img.src = url;
 }
 
 function exprFilter(expr) {
@@ -899,6 +952,7 @@ let textStuck = true;
 
 function typewrite(target, text) {
     stopTypewriter();
+    playCurText = text;
     if (!getSettings().typewriter) {
         target.textContent = text;
         return;
@@ -958,23 +1012,15 @@ function refresh() {
     } else if (char?.avatar) {
         avatarUrl = `/thumbnail?type=avatar&file=${encodeURIComponent(char.avatar)}`;
     }
-    // generated media attached to the message wins: character shots become the
-    // stage sprite, background shots pin the VN background via bgMap
+    // generated media pinned by the scene pipeline shows on the stage itself
+    // (cast sprites / background / CG); the dialog keeps only foreign media
     const mediaList = Array.isArray(last?.mes?.extra?.media) ? last.mes.extra.media : [];
-    const mediaImage = mediaList.find(m => String(m?.type ?? '').toLowerCase() === 'image' && m?.url);
-    let spriteUrl = avatarUrl;
-    if (mediaImage && /character/i.test(String(mediaImage.title ?? ''))) spriteUrl = mediaImage.url;
-    setSprite(spriteUrl);
 
     const st = getState();
     if (last) {
         const scene = parseSceneTag(last.mes.mes);
         const expr = scene.expression || 'neutral';
         const text = stripSceneTags(last.mes.mes);
-        const filter = exprFilter(expr);
-        const stageImg = ui.querySelector('.vnt-sprite img.vnt-in') ?? ui.querySelector('.vnt-sprite img');
-        stageImg.style.filter = filter;
-        ui.querySelector('.vnt-chip').style.filter = filter;
         ui.querySelector('.vnt-name').textContent = last.mes.name || chName || '...';
         const sub = ui.querySelector('.vnt-subname');
         const outfit = scene.outfit || st.outfit.char;
@@ -983,11 +1029,11 @@ function refresh() {
         sub.style.display = sub.textContent ? '' : 'none';
 
         const tEl = ui.querySelector('.vnt-text');
-        // scene images attached by ComfyUI: character shots take the stage
-        // sprite further down; anything else shows inside the reply here
-        const media = (last.mes?.extra?.media ?? [])
+        // the dialog shows only foreign media; scene-pipeline images live on
+        // the stage (cast sprites / background / CG)
+        const media = mediaList
             .filter(x => x && x.url && String(x.type ?? 'image').toLowerCase() === 'image')
-            .filter(x => !/character/i.test(String(x.title ?? '')));
+            .filter(x => !/^VN scene/i.test(String(x.title ?? '')));
         const mediaBox = ui.querySelector('.vnt-media-box');
         if (mediaBox) {
             mediaBox.innerHTML = media.map(x => `<img class="vnt-media-img" src="${esc(x.url)}" alt="">`).join('');
@@ -996,26 +1042,37 @@ function refresh() {
         const tr = cachedTranslation(last.id);
         // VN mode: the translation replaces the original inside the dialog
         // box; the language button toggles back to the original
-        if (vntPaintedMesId !== last.id) { vntToggleOriginal = false; vntPaintedMesId = last.id; textStuck = true; }
+        if (vntPaintedMesId !== last.id) {
+            vntToggleOriginal = false; vntPaintedMesId = last.id; textStuck = true;
+            playMesId = last.id; playSeg = 0;
+        }
         const showOriginal = vntToggleOriginal || !tr;
         const body = fixQuoteRuns(showOriginal ? text : tr);
-        // markdown (bold/italic) and HTML must be rendered, not shown raw:
-        // typewriter only for pure prose without any markup markers.
-        // repaint only when the painted content changes — setting innerHTML
-        // resets scrollTop and would snap the reader back to the bottom
-        const hasMarkup = /[<>]|[*_`~]/.test(body);
-        const paintKey = `${last.id}|${showOriginal}|${body}`;
+        // classic VN playback: the reply plays line by line — speech keeps
+        // the nameplate, narration hides it; the last line hands over to the
+        // composer/chips. Repaint only on content change: innerHTML would
+        // reset the scroll and restart the typewriter.
+        playSegs = splitPlaybackSegments(body);
+        if (!playSegs.length) playSegs = [{ type: 'action', text: body }];
+        if (playSeg >= playSegs.length) playSeg = playSegs.length - 1;
+        const cur = playSegs[playSeg] ?? playSegs[0];
+        const paintKey = `${last.id}|${playSeg}|${showOriginal}|${cur.text}`;
         if (tEl.__vntPaint !== paintKey) {
             tEl.__vntPaint = paintKey;
-            if (hasMarkup || !s.typewriter) {
+            playCurKey = paintKey;
+            if (/[<>]|[*_`~]/.test(cur.text) || !s.typewriter) {
                 stopTypewriter();
-                tEl.innerHTML = messageFormatting(body, last.mes.name || chName || '', false, false, false);
+                tEl.innerHTML = messageFormatting(cur.text, last.mes.name || chName || '', false, false, false);
                 if (textStuck) tEl.scrollTop = tEl.scrollHeight;
             } else {
-                typewrite(tEl, body);
+                typewrite(tEl, cur.text);
             }
             styleSfx(tEl);
         }
+        // nameplate lives only while the character speaks
+        ui.querySelector('.vnt-namerow')?.classList.toggle('vnt-hidden', cur.type !== 'speech');
+        ui.querySelector('.vnt-advance')?.classList.toggle('vnt-hidden', playSeg >= playSegs.length - 1);
+        ui.querySelector('.vnt-composer')?.classList.toggle('vnt-hidden', playSeg < playSegs.length - 1);
         // the separate translation strip under the text is retired — the
         // translation now lives in the dialog box itself
         const trEl = ui.querySelector('.vnt-translation');
@@ -1025,6 +1082,11 @@ function refresh() {
         if (scene.background) setBackground(scene.background);
         else if (!st.scene.background) setBackground('night');
         else setBackground(st.scene.background);
+        // key-scene CG replaces the cast while it is the current moment
+        const cgMap = img.cgMap?.[chatKey()];
+        const cgOn = !!(cgActive && cgMap && Number(cgMap.mesId) <= Number(last.id));
+        setCG(cgOn ? cgMap.url : '');
+        if (!cgOn) renderCast(last.mes.name || chName, expr);
         // remember scene in state
         let sceneChanged = false;
         if (scene.background && scene.background !== st.scene.background) { st.scene.background = scene.background; sceneChanged = true; }
@@ -1798,18 +1860,37 @@ function makeClientId() {
     return 'vnt-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2);
 }
 
+// The user's Anima 2B prompting bible: every generated image (background,
+// sprite, CG) must be prompted exactly this way. Realism is forbidden.
+const ANIMA_RULES = [
+    '=== ANIMA 2B PROMPT RULES (the "prompt" field must follow them exactly) ===',
+    '- Output format: ONE positive prompt — structured lowercase comma-separated tags first, then a PERIOD, then rich novel-like prose (3-5 sentences). No double commas, no trailing commas, no quotes/backticks inside.',
+    '- Tag sequence: "masterpiece, best quality, score_7, <safety tag>, <subject count>, <core appearance tags>." — lowercase everywhere, spaces instead of underscores (only score_7 keeps its underscore), Gelbooru tag preference.',
+    '- Weights only as (tag:1.5..2.5); lower multipliers do nothing on the Qwen3 0.6B encoder. Semantic grammar and spatial prepositions are understood.',
+    '- Safety tag: safe | sensitive | nsfw | explicit. Choose explicit/nsfw without hesitation when the moment is suggestive or adult.',
+    '- Prose must define: camera (shot scale + angle + lens feel, e.g. "medium shot, eye level, shallow depth of field"), lighting direction, environment, atmosphere, active character behavior. Three depth planes: foreground framing element, midground subject, background context.',
+    '- Realism is FORBIDDEN: anime illustration style only. Never photo, never photorealistic, never 3D render.',
+    '- Character consistency: copy appearance tag blocks (hair color+length, eyes, marks, outfit) byte-identical from the previous prompt; update ONLY action, pose, expression, camera if needed. Never vary synonyms.',
+].join('\n');
+
 function buildDirectorPrompt(userName, charName, transcript) {
     return [
-        'Pause the roleplay. You are the Scene Director for a visual-novel experience. Analyze the recent scene and decide what single image to show right now.',
-        'Rules:',
-        '- type "character": a person or creature in focus. Describe what the player sees when looking at them (face, body, action, pose, expression, clothing) including their permanent appearance (hair, eyes, species traits) so the image matches the story.',
-        '- type "background": the environment or location; no person in focus.',
-        '- type "none": the moment has no meaningful visual content (pure dialogue, abstract thoughts).',
-        '- "prompt": write in English. First 1-3 short sentences describing the exact current moment (subject, action, expression, clothing, setting, lighting), then style tags: cinematic, detailed, atmospheric. Max ~80 words. Do not use quotation marks inside.',
-        '- "subject": when type is "character" — the exact name of the person in focus, as it appears in the transcript; otherwise empty string.',
-        '- "ratio" must be one of: ' + Object.keys(RATIO_BINS).join(', ') + '. Prefer wide (16:9, 3:2) for locations, portrait (4:5, 3:4, 9:16) for close-ups of people, 1:1 for neutral shots.',
+        'Pause the roleplay. You are the Scene Director of a visual-novel stage. Two jobs in one JSON answer:',
+        '1) "cast": characters PRESENT in the current scene right now, EXCEPT the player — the player is the camera and never stands on stage (1-4 names exactly as in the transcript; [] for an empty room). Anyone left out of the list leaves the stage.',
+        '2) "type": the single image to paint now (or none):',
+        '   - "background": paint the environment — new location, or no painted background yet. No people in the art.',
+        '   - "cg": a KEY story moment or an explicit/NSFW scene — one full illustration covering the whole stage with ALL present characters drawn together in the art (multi-character rules below).',
+        '   - "none": sprites and background are fine as they are.',
+        'For "background" and "cg" the "prompt" field is the FINAL Anima prompt built by every rule below.',
+        ANIMA_RULES,
+        '- For "cg": discrete identity blocks per character joined by the word "and" (never interleaved), explicit frame position per character in the prose, ONE contact point per pair, explicit height/scale comparisons.',
+        '- "ratio": one of ' + Object.keys(RATIO_BINS).join(', ') + '. Wide (16:9, 3:2) for locations and CG.',
+        '- "safety": the safety tag you used in the prompt.',
         '- "negative": only EXTRA negative tags beyond the defaults; keep short or empty.',
-        'Respond with ONLY valid JSON (no markdown, no comments): {"type":"character|background|none","ratio":"W:H","prompt":"...","negative":"","subject":""}',
+        'Respond with ONLY valid JSON (no markdown, no comments): {"type":"background|cg|none","ratio":"W:H","cast":["Name","Name"],"subject":"","safety":"safe","prompt":"...","negative":""}',
+        '',
+        'Previous painted prompt (continuity source: appearance blocks byte-identical, location/lighting preserved, action updated):',
+        String(imgSettings().lastScenePrompt ?? '(none yet)'),
         '',
         'Recent scene:',
         transcript,
@@ -1827,6 +1908,8 @@ function attachMediaToMessageDom(mesid, message, url, title) {
 }
 
 let imageBusy = false;
+let spriteChain = Promise.resolve();
+const spritePending = new Set();
 
 // sceneOverride (debug/advanced): { prompt, negative?, ratio?, type? } skips the
 // director LLM call — lets power users (and tests) render a fixed scene.
@@ -1840,13 +1923,14 @@ async function generateSceneImage(sceneOverride = null) {
         const health = await checkComfy(img.comfyUrl);
         if (!health?.ok) throw new Error(`ComfyUI at ${img.comfyUrl} is not reachable (${health?.error ?? 'no answer'})`);
 
-        // 1) director: pick the shot from the recent transcript
+        // 1) director: cast + the image to paint, from the recent transcript
         const ctx = getContext();
         const charName = ctx.name2 || 'the character';
         const userName = ctx.name1 || 'the user';
+        const last = lastAiMessage();
         let scene = null;
         if (sceneOverride && typeof sceneOverride.prompt === 'string' && sceneOverride.prompt.trim()) {
-            scene = { type: sceneOverride.type ?? 'background', ratio: sceneOverride.ratio ?? '', negative: sceneOverride.negative ?? '', prompt: sceneOverride.prompt };
+            scene = { type: sceneOverride.type ?? 'background', ratio: sceneOverride.ratio ?? '', negative: sceneOverride.negative ?? '', safety: sceneOverride.safety ?? 'safe', prompt: sceneOverride.prompt };
         } else {
             const recent = (ctx.chat ?? []).slice(-6);
             if (!recent.length) throw new Error('the chat is empty');
@@ -1864,75 +1948,26 @@ async function generateSceneImage(sceneOverride = null) {
                 });
                 parsed = parseLenientJson(String(raw ?? ''));
             } catch { parsed = null; }
-            if (parsed && parsed.prompt && parsed.type !== 'none') {
+            if (parsed && (parsed.type === 'none' || typeof parsed.prompt === 'string')) {
                 scene = parsed;
+                window.__vntLastDirector = scene; // debug: inspect the raw director plan
             } else {
                 // fallback without a second LLM call: the chat model's own scene
                 // tags, or a template from the current scene state
-                const tags = parseSceneTag(lastAiMessage()?.mes?.mes ?? '');
+                const tags = parseSceneTag(last?.mes?.mes ?? '');
                 if (tags.bggen) {
-                    scene = { type: 'background', ratio: getScreenRatio(), prompt: tags.bggen, negative: '' };
+                    scene = { type: 'background', ratio: getScreenRatio(), prompt: tags.bggen, negative: '', safety: 'safe' };
                 } else {
-                    const stf = getState();
-                    scene = {
-                        type: 'background', ratio: getScreenRatio(), negative: '',
-                        prompt: `${stf.scene.background || 'night'} scenery environment, detailed background, cinematic lighting, no people`,
-                    };
+                    scene = { type: 'none' };
                 }
-                toastr.info('Director LLM is quiet — using the scene-tag prompt instead', 'VN Theatre');
+                toastr.info('Director LLM is quiet — cast only', 'VN Theatre');
             }
         }
-        // backdrops always match the user's screen orientation; the director
-        // only picks portrait framing for character shots
-        if (scene && (!scene.type || scene.type === 'background')) {
+        // backdrops always match the user's screen orientation
+        if (scene && (!scene.type || scene.type === 'background') && !scene.ratio) {
             scene.ratio = getScreenRatio();
         }
-
-        // 2) workflow: anima (Qwen-Image) or sdxl, portrait/landscape by type
-        updateFxPill(scene.type === 'character' ? 'VN Theatre: painting the character…' : 'VN Theatre: painting the scene…');
-        const engine = img.preset === 'sdxl' ? 'sdxl' : 'anima';
-        const isCharacter = scene.type === 'character';
-        const wfName = engine === 'anima' ? 'anima_t2i' : (isCharacter ? 'sdxl_portrait' : 'sdxl_default');
-        const workflowText = await loadBundledWorkflow(wfName);
-        const ratio = String(scene.ratio ?? '').trim() || (isCharacter ? '3:4' : getScreenRatio());
-        const { width, height } = getResolutionForRatio(ratio, 1024);
-        const seed = img.seed >= 0 ? img.seed : Math.floor(Math.random() * 2 ** 48);
-        const prompt = joinTags([img.qualityTags, scene.prompt, isCharacter ? 'pov, first-person view, first-person perspective' : '']);
-        const negative = joinTags([img.negativePrompt, scene.negative]);
-        const workflow = substituteWorkflow(workflowText, {
-            prompt, negative, width, height, seed,
-            steps: img.steps, cfg: img.cfg,
-            model: img.checkpoint || (engine === 'anima' ? 'anima-base-v1.0.safetensors' : ''),
-            denoise: 1.0,
-            initImage: '',
-            lora: img.lora ?? '',
-            loraStrength: img.loraStrength ?? 1.0,
-        });
-
-        // 3) generate + persist
-        const generated = await generateImage({ url: img.comfyUrl, workflow, clientId: makeClientId() });
-        const scaled = await downscaleImageBlob(generated.blob, img.maxDim);
-        const b64 = await blobToBase64(scaled.blob);
-        const ext = String(scaled.mime || '').includes('jpeg') ? 'jpg' : 'png';
-        const baseName = 'vnt_' + (ctx.chatId ?? 'chat') + '_' + Date.now();
-        const url = await saveBase64AsFile(b64, 'vnt-scenes', baseName, ext);
-
-        // 4) deliver: attach to message + optional VN background
-        const last = lastAiMessage();
-        if (img.attachToMessage && last) {
-            attachMediaToMessageDom(last.id, last.mes, url, isCharacter ? 'VN scene — character' : 'VN scene — background');
-            if (getSettings().enabled) refresh(); // the picture joins the VN reply at once
-        }
-        if (img.setAsBackground && !isCharacter) {
-            img.bgMap = img.bgMap ?? {};
-            img.bgMap[chatKey()] = { url };
-            saveSettingsDebounced();
-            refresh();
-        }
-        await ctx.saveChat?.();
-        hideFxPill();
-        toastr.success(`Scene image ready (${scene.type}, ${ratio})`, 'VN Theatre');
-        return { ok: true, url, type: scene.type, ratio };
+        return await executeScenePlan(scene);
     } catch (e) {
         hideFxPill();
         toastr.error(String(e?.message ?? e).slice(0, 220), 'VN Theatre');
@@ -1940,6 +1975,197 @@ async function generateSceneImage(sceneOverride = null) {
     } finally {
         imageBusy = false;
     }
+}
+
+// the director's plan → stage updates: cast sprites first, then the painting
+async function executeScenePlan(scene) {
+    const img = imgSettings();
+    const ctx = getContext();
+    const last = lastAiMessage();
+    syncCast(scene.cast);
+    cgActive = scene.type === 'cg';
+    if (scene.type !== 'cg') img.lastScenePrompt = scene.type === 'background' ? scene.prompt : img.lastScenePrompt;
+
+    if (scene.type === 'cg') {
+        const url = await ensureCG(scene);
+        if (getSettings().enabled) refresh();
+        hideFxPill();
+        toastr.success('Key-scene CG ready', 'VN Theatre');
+        return { ok: true, url, type: 'cg' };
+    }
+    if (scene.type === 'background') {
+        updateFxPill('VN Theatre: painting the scene…');
+        const url = await paintScene({ prompt: animaPrompt(scene.prompt, scene.safety), negative: scene.negative, ratio: String(scene.ratio ?? '').trim() || getScreenRatio() });
+        if (img.attachToMessage && last) {
+            attachMediaToMessageDom(last.id, last.mes, url, 'VN scene — background');
+        }
+        img.bgMap = img.bgMap ?? {};
+        img.bgMap[chatKey()] = { url };
+        if (typeof scene.prompt === 'string' && scene.prompt.trim()) img.lastScenePrompt = scene.prompt.trim();
+        saveSettingsDebounced();
+        await ctx.saveChat?.();
+        if (getSettings().enabled) refresh();
+        hideFxPill();
+        toastr.success('Background ready', 'VN Theatre');
+        return { ok: true, url, type: 'background' };
+    }
+    // none: only the cast (and any pending sprites) update the stage
+    hideFxPill();
+    if (getSettings().enabled) refresh();
+    return { ok: true, type: 'none', cast: castNames };
+}
+
+// ensure the Anima prompt starts with the mandatory quality prefix and
+// carries the anime style anchor — the whole stage must share one style
+// (realism is forbidden, sprites and paintings must look like one show)
+function animaPrompt(scenePrompt, safety) {
+    const p = String(scenePrompt ?? '').trim();
+    const base = /^(masterpiece|best quality|score_7)/i.test(p)
+        ? p
+        : joinTags(['masterpiece, best quality, score_7', safety || 'safe', p]);
+    return joinTags([base, 'anime style, 2d anime illustration, cel shaded']);
+}
+
+// one ComfyUI run: Anima t2i (+ optional RMBG for sprites) → saved file URL
+async function paintScene({ prompt, negative, ratio, sprite = false }) {
+    const img = imgSettings();
+    const engine = img.preset === 'sdxl' ? 'sdxl' : 'anima';
+    const wfName = sprite ? 'anima_sprite' : (engine === 'anima' ? 'anima_t2i' : 'sdxl_default');
+    const workflowText = await loadBundledWorkflow(wfName);
+    const { width, height } = getResolutionForRatio(ratio, 1024);
+    const seed = img.seed >= 0 ? img.seed : Math.floor(Math.random() * 2 ** 48);
+    const workflow = substituteWorkflow(workflowText, {
+        prompt, negative, width, height, seed,
+        steps: img.steps, cfg: img.cfg,
+        model: img.checkpoint || (engine === 'anima' ? 'anima-base-v1.0.safetensors' : ''),
+        denoise: 1.0,
+        initImage: '',
+        lora: img.lora ?? '',
+        loraStrength: img.loraStrength ?? 1.0,
+    });
+    const generated = await generateImage({ url: img.comfyUrl, workflow, clientId: makeClientId() });
+    const scaled = await downscaleImageBlob(generated.blob, img.maxDim);
+    const b64 = await blobToBase64(scaled.blob);
+    const ext = sprite ? 'png' : (String(scaled.mime || '').includes('jpeg') ? 'jpg' : 'png');
+    const baseName = 'vnt_' + (getContext().chatId ?? 'chat') + '_' + Date.now();
+    return await saveBase64AsFile(b64, sprite ? 'vnt-sprites' : 'vnt-scenes', baseName, ext);
+}
+
+// stage roster: who stands where; missing characters get sprites queued.
+// The player is the camera — never on the stage.
+function syncCast(cast) {
+    const img = imgSettings();
+    img.spriteMap = img.spriteMap ?? {};
+    const ctx = getContext();
+    const player = String(ctx.name1 ?? '').toLowerCase();
+    const list = (Array.isArray(cast) ? cast : [])
+        .map(n => String(n ?? '').trim())
+        .filter(Boolean)
+        .filter(n => n.toLowerCase() !== player && !/^(you|player|the player)$/i.test(n))
+        .filter((n, i, a) => a.findIndex(x => x.toLowerCase() === n.toLowerCase()) === i)
+        .slice(0, 4);
+    castNames = list;
+    for (const name of castNames) {
+        if (!img.spriteMap[name]?.url) ensureSprite(name);
+    }
+    if (getSettings().enabled) refresh();
+}
+
+// sprite generations run strictly one at a time: chained promises keep
+// ComfyUI from stampeding when the director drops a whole cast at once
+function ensureSprite(name) {
+    if (spritePending.has(name)) return;
+    spritePending.add(name);
+    spriteChain = spriteChain
+        .then(() => genSprite(name))
+        .catch(e => toastr.error(`${name} sprite failed: ${String(e?.message ?? e).slice(0, 120)}`, 'VN Theatre'))
+        .finally(() => spritePending.delete(name));
+}
+
+async function genSprite(name) {
+    const img = imgSettings();
+    img.spriteMap = img.spriteMap ?? {};
+    updateFxPill(`VN Theatre: painting ${name}…`);
+    const tags = img.spriteMap[name]?.tags ?? await extractSignature(name);
+    // waist-up framing: the figure reads at dialogue distance, VN-style
+    const prompt = joinTags(['masterpiece, best quality, score_7, safe, solo', tags,
+        'upper body, waist-up framing, medium close shot, simple background',
+        'anime style, 2d anime illustration, cel shaded']) +
+        `. ${name} faces the viewer from the waist up in a relaxed neutral pose, head and torso centered in the frame, clean readable silhouette, soft even lighting, anime illustration.`;
+    const url = await paintScene({
+        prompt,
+        negative: 'realistic, photorealistic, photo, 3d render, multiple views, split screen, cropped, out of frame, full body, feet',
+        ratio: '3:4',
+        sprite: true,
+    });
+    img.spriteMap[name] = { url, tags };
+    saveSettingsDebounced();
+    if (getSettings().enabled) refresh();
+    toastr.success(`${name} joined the stage`, 'VN Theatre');
+}
+
+// reusable visual signature block: LLM distills the card + story once per
+// character; every later sprite reuses it verbatim (consistency protocol)
+async function extractSignature(name) {
+    const ctx = getContext();
+    const char = (ctx.characters ?? []).find(c => String(c?.name ?? '').toLowerCase() === String(name).toLowerCase());
+    const desc = String(char?.description ?? '').replace(/\s+/g, ' ').slice(0, 1200);
+    const transcript = (ctx.chat ?? [])
+        .filter(m => String(m?.mes ?? '').toLowerCase().includes(String(name).toLowerCase()))
+        .slice(-3)
+        .map(m => `${m.is_user ? 'Player' : (m.name || '')}: ${stripSceneTags(m.mes).replace(/\s+/g, ' ').slice(0, 300)}`)
+        .join('\n');
+    await requireApi();
+    const raw = await ctx.generateRaw({
+        prompt: [
+            `Character: ${name}`,
+            `Card description: ${desc || '(none)'}`,
+            'How the story shows them recently:',
+            transcript || '(nothing)',
+            '',
+            `Build the reusable visual signature block for "${name}": comma-separated lowercase gelbooru-style tags (spaces, not underscores), max 12 tags: gender + age appearance, hair color + length + style, eye color, body type, distinguishing features, default outfit. No prose, no quotes.`,
+        ].join('\n'),
+        systemPrompt: 'Reply with ONLY the comma-separated tag block.',
+    });
+    const tags = String(raw ?? '')
+        .replace(/[`"*]/g, '')
+        .split('\n')
+        .map(s => s.trim().replace(/,+$/, ''))
+        .filter(Boolean)
+        .join(', ')
+        .slice(0, 400);
+    if (!tags) throw new Error('empty signature');
+    return tags;
+}
+
+// key-scene / NSFW full art; reused while the scene continues (no re-paint
+// per message), regenerated when the moment changes
+async function ensureCG(scene) {
+    const img = imgSettings();
+    const ctx = getContext();
+    const last = lastAiMessage();
+    const key = chatKey();
+    img.cgMap = img.cgMap ?? {};
+    const existing = img.cgMap[key];
+    // same scene continuation: last CG made within the last 3 AI messages
+    if (existing?.url && Number(existing.mesId) >= Number(last?.id ?? 0) - 3) {
+        cgActive = true;
+        return existing.url;
+    }
+    updateFxPill('VN Theatre: painting the key scene…');
+    const url = await paintScene({
+        prompt: animaPrompt(scene.prompt, scene.safety),
+        negative: scene.negative,
+        ratio: String(scene.ratio ?? '').trim() || getScreenRatio(),
+    });
+    if (img.attachToMessage && last) {
+        attachMediaToMessageDom(last.id, last.mes, url, 'VN scene — CG');
+    }
+    img.cgMap[key] = { url, mesId: last?.id ?? 0 };
+    if (typeof scene.prompt === 'string' && scene.prompt.trim()) img.lastScenePrompt = scene.prompt.trim();
+    saveSettingsDebounced();
+    await ctx.saveChat?.();
+    return url;
 }
 
 // ===================================================================
@@ -2022,6 +2248,11 @@ function bindEvents() {
         if (last) {
             runJudge(last.id);
             if (getSettings().autoChoices) generateChoices();
+            // stage director: refresh the cast and paint the next asset
+            const img = imgSettings();
+            if (img.enabled && img.autoDirector && !imageBusy) {
+                setTimeout(() => { generateSceneImage().catch(() => {}); }, 3000);
+            }
         }
     });
     // the used options are gone once the player speaks; the next character
@@ -2044,6 +2275,13 @@ function bindEvents() {
         }
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        // the stage of another chat starts empty: its cast and CG moment
+        // belong to a different scene
+        castNames = [];
+        const img = imgSettings();
+        const cgMap = img.cgMap?.[chatKey()];
+        const lastNow = lastAiMessage();
+        cgActive = !!(cgMap?.url && lastNow && Number(cgMap.mesId) >= Number(lastNow.id) - 2);
         setTimeout(() => {
             decorateAllMessages(); refresh(); renderDrawer(); updatePromptInjections();
             // chips must match the chat the player is walking into
@@ -2091,6 +2329,7 @@ function buildSettings() {
         <div class="vnt-set-row"><b>Image generation (ComfyUI)</b></div>
         <div class="vnt-set-row">
             <label class="checkbox_label"><input id="vnt-set-img" type="checkbox" ${img.enabled ? 'checked' : ''}/> Enabled</label>
+            <label class="checkbox_label"><input id="vnt-set-img-autodir" type="checkbox" ${img.autoDirector ? 'checked' : ''}/> Auto scene director (cast sprites, backgrounds, key-scene CG after each reply)</label>
             <label>Preset
                 <select id="vnt-set-img-preset">
                     <option value="anima" ${img.preset === 'anima' ? 'selected' : ''}>Anima (Qwen-Image)</option>
@@ -2148,6 +2387,7 @@ function buildSettings() {
     // image generation
     const imgSet = (id, fn) => q(id).addEventListener('change', e => { fn(e); saveSettingsDebounced(); });
     imgSet('#vnt-set-img', e => { img.enabled = e.target.checked; });
+    imgSet('#vnt-set-img-autodir', e => { img.autoDirector = e.target.checked; });
     imgSet('#vnt-set-img-preset', e => { img.preset = e.target.value; });
     imgSet('#vnt-set-img-url', e => { img.comfyUrl = e.target.value.trim() || DEFAULT_SETTINGS.image.comfyUrl; });
     imgSet('#vnt-set-img-attach', e => { img.attachToMessage = e.target.checked; });
@@ -2226,6 +2466,8 @@ jQuery(() => {
         cycleEffect,
         screenRatio: getScreenRatio,
         genImage: generateSceneImage,
+        castNow: (names) => { syncCast(names); return castNames; },
+        spriteNow: (name) => ensureSprite(name),
         judgeRaw: async () => {
             const ctx = getContext();
             const chat = ctx.chat ?? [];
