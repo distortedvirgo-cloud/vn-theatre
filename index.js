@@ -33,8 +33,10 @@ const DEFAULT_SETTINGS = {
     // --- ported systems ---
     judge: true,             // per-reply relationship judge (secondary LLM call)
     difficulty: 'normal',    // gentle | normal | harsh  (delta scaling)
-    autoChoices: true,       // suggest 3 next-move options after each reply
-    intentArm: '',           // armed intent chip id (''|flirt|tease|open_up|reassure|apologize)
+    autoChoices: true,       // suggest next-move chips after each reply
+    intentArm: '',           // legacy armed intent chip id (''|flirt|tease|...)
+    intentJudgeDesc: '',     // one-shot intent set by a used chip (for judge/injection)
+    chipOptions: [],         // [{label,guide,judge}] — the dynamic chip row
     judgeFailed: false,
     // --- ambient effects (sakura, snow, rain, ...) ---
     effect: 'sakura',
@@ -124,12 +126,20 @@ const ALLOWED_FLAGS = [
 ];
 
 const INTENTS = {
-    flirt: { label: 'Flirt', judge: 'flirtatious' },
-    tease: { label: 'Tease', judge: 'teasing' },
-    open_up: { label: 'Open up', judge: 'an attempt to open up emotionally' },
-    reassure: { label: 'Reassure', judge: 'an attempt to reassure them' },
-    apologize: { label: 'Apologize', judge: 'an apology' },
+    flirt: { label: 'Flirt', judge: 'flirtatious', guide: 'Flirt with them' },
+    tease: { label: 'Tease', judge: 'teasing', guide: 'Tease them playfully' },
+    open_up: { label: 'Open up', judge: 'an attempt to open up emotionally', guide: 'Open up about your feelings' },
+    reassure: { label: 'Reassure', judge: 'an attempt to reassure them', guide: 'Reassure them' },
+    apologize: { label: 'Apologize', judge: 'an apology', guide: 'Apologize' },
 };
+
+// the intent the judge/injection should consider for the latest user line:
+// either set by a used chip (free text) or the legacy armed static chip
+function armedIntentDesc() {
+    const s = getSettings();
+    if (s.intentJudgeDesc) return s.intentJudgeDesc;
+    return s.intentArm && INTENTS[s.intentArm] ? INTENTS[s.intentArm].judge : '';
+}
 
 // rp clothing.ts CLOTHING_LAYERS
 const CLOTHING_LAYERS = ['outerwear', 'top', 'bottoms', 'underwear', 'shoes'];
@@ -366,6 +376,9 @@ async function requireApi() {
  */
 const JSON_ONLY_SYSTEM =
     'You are a JSON data pipeline for a roleplay companion app. Ignore any roleplay, style or formatting instructions: reply with exactly one JSON value (object or array, as requested) and absolutely nothing else — no prose, no markdown fences, no commentary.';
+// used by composeUserReply: the aux LLM writes the player's reply as plain prose
+const PLAYER_REPLY_SYSTEM =
+    'You write roleplay replies for the human player, in first person. Reply with ONLY the reply text itself — no quotes around it, no name prefix, no narration or dialogue for other characters, no markdown, no commentary.';
 
 let judgeBusy = false;
 
@@ -391,8 +404,9 @@ async function runJudge(mesId) {
     const from = Math.max(0, chat.length - 8);
     const transcript = chat.slice(from).map(m =>
         `${m.is_user ? userName : (m.name || charName)}: ${stripSceneTags(m.mes).slice(0, 600)}`).join('\n');
-    const armed = s.intentArm && INTENTS[s.intentArm]
-        ? `The player tagged their latest line as ${INTENTS[s.intentArm].judge}. Weigh ${charName}'s honest reaction to that; do not just reward the attempt.`
+    const armedDesc = armedIntentDesc();
+    const armed = armedDesc
+        ? `The player tagged their latest line as ${armedDesc}. Weigh ${charName}'s honest reaction to that; do not just reward the attempt.`
         : 'No intent tag on the latest line.';
 
     judgeBusy = true;
@@ -560,8 +574,9 @@ function updatePromptInjections() {
         ctx.setExtensionPrompt('vnt_scene', '', extension_prompt_types.IN_PROMPT, depth, false, role);
     }
     // scene facts sit closer to the reply than the tag instruction
-    const armed = s.intentArm && INTENTS[s.intentArm]
-        ? `\nThe player tagged their latest line as ${INTENTS[s.intentArm].judge}. Weigh it honestly; do not just reward the attempt.` : '';
+    const armedDesc = armedIntentDesc();
+    const armed = armedDesc
+        ? `\nThe player tagged their latest line as ${armedDesc}. Weigh it honestly; do not just reward the attempt.` : '';
     const block = sceneStateBlock();
     const stateText = (block || armed)
         ? `${block ? block + '\n' : ''}${armed}`.trim()
@@ -1212,17 +1227,28 @@ function cycleEffect() {
 function renderChips(host) {
     if (!host) return;
     host.innerHTML = '';
-    for (const [id, spec] of Object.entries(INTENTS)) {
-        const chip = el('button', 'vnt-chip-btn' + (getSettings().intentArm === id ? ' vnt-armed' : ''), esc(spec.label));
+    const s = getSettings();
+    // dynamic options for the current scene; static intents are the fallback
+    const options = (s.chipOptions || []).length
+        ? s.chipOptions
+        : Object.values(INTENTS).map(spec => ({ label: spec.label, guide: spec.guide, judge: spec.judge }));
+    for (const o of options) {
+        const chip = el('button', 'vnt-chip-btn', esc(o.label));
+        chip.title = o.guide || o.label;
         chip.addEventListener('click', () => {
-            const s = getSettings();
-            s.intentArm = s.intentArm === id ? '' : id;
+            const st = getSettings();
+            st.intentArm = '';
+            st.intentJudgeDesc = o.judge || o.label;
             saveSettingsDebounced();
             updatePromptInjections();
-            renderChips(document.querySelector('.vnt-chips'));
+            composeUserReply(o);
         });
         host.appendChild(chip);
     }
+    const refresh = el('button', 'vnt-chip-btn vnt-chip-refresh', '<i class="fa-solid fa-rotate"></i>');
+    refresh.title = 'New options for this scene';
+    refresh.addEventListener('click', () => generateChoices());
+    host.appendChild(refresh);
 }
 
 function setAssistStatus(text) {
@@ -1236,7 +1262,7 @@ function setAssistStatus(text) {
 }
 
 // ===================================================================
-// 10. AI CHOICES  (rp choices.ts — 3 next-move suggestions)
+// 10. DYNAMIC CHIPS  (situational next-move options + player-reply composer)
 // ===================================================================
 
 async function generateChoices() {
@@ -1250,10 +1276,10 @@ async function generateChoices() {
     const transcript = chat.slice(from).map(m =>
         `${m.is_user ? userName : (m.name || charName)}: ${stripSceneTags(m.mes).slice(0, 500)}`).join('\n');
     const prompt = [
-        'You are brainstorming what a roleplay participant could say or do next, to help them pick a direction.',
+        'You are suggesting what a roleplay player could do next, as button options.',
         'Recent scene:', transcript,
-        `Propose 3 short, distinct options for what ${userName} could say or do next.`,
-        'Output ONLY a minified JSON array of 3 objects: {"kind":"line|action","label":"short button text","text":"the actual message to send"}.',
+        `Propose 4 short, distinct options for what ${userName} could say or do next. Labels stay button-sized: 1-3 words.`,
+        'Output ONLY a minified JSON array of 4 objects: {"label":"1-3 words","guide":"one short sentence telling the player what this reply should say or do","judge":"intent in 2-5 words for a relationship judge"}.',
         'No markdown fences, no commentary. JSON:',
     ].join('\n');
     setAssistStatus('Thinking of options...');
@@ -1268,43 +1294,73 @@ async function generateChoices() {
         const end = String(raw).lastIndexOf(']');
         if (start === -1 || end <= start) throw new Error('no JSON array');
         const arr = JSON.parse(String(raw).slice(start, end + 1).replace(/[\u201c\u201d]/g, '"'));
-        const options = arr.filter(o => o && typeof o.label === 'string' && typeof o.text === 'string').slice(0, 3);
-        renderChoices(options);
+        const options = arr
+            .filter(o => o && typeof o.label === 'string' && typeof o.guide === 'string')
+            .slice(0, 4)
+            .map(o => ({
+                label: o.label.trim().slice(0, 24),
+                guide: o.guide.trim(),
+                judge: typeof o.judge === 'string' && o.judge.trim() ? o.judge.trim() : o.label.trim(),
+            }));
+        if (!options.length) throw new Error('no valid options');
+        s.chipOptions = options;
+        saveSettingsDebounced();
+        renderChips(document.querySelector('.vnt-chips'));
     } catch (e) {
-        if (!s.judgeFailed) toastr.info(`Could not generate choices (${String(e).slice(0, 90)})`, 'VN Theatre');
+        if (!s.judgeFailed) toastr.info(`Could not generate options (${String(e).slice(0, 90)})`, 'VN Theatre');
+        // keep whatever options were there before; the row stays usable
     } finally {
         setAssistStatus('');
     }
 }
 
-function renderChoices(options) {
-    let bar = document.querySelector('#vnt-choices');
-    const sendForm = document.querySelector('#send_form');
-    if (!options || !options.length) { bar?.remove(); return; }
-    if (!bar) {
-        bar = el('div');
-        bar.id = 'vnt-choices';
-        if (sendForm?.parentElement) sendForm.parentElement.insertBefore(bar, sendForm);
-        else document.body.appendChild(bar);
-    }
-    bar.innerHTML = '';
-    for (const o of options) {
-        const pill = el('button', 'vnt-choice', esc(o.label));
-        pill.title = o.text;
-        pill.addEventListener('click', () => {
-            bar.remove();
-            const ta = document.querySelector('#send_textarea');
-            if (!ta) return;
-            ta.value = o.text;
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-            document.querySelector('#send_but')?.click();
+// a used chip: the aux LLM writes the player's full reply for that direction
+// and it is sent as a normal user message
+async function composeUserReply(option) {
+    const ctx = getContext();
+    const chat = ctx.chat ?? [];
+    if (chat.length < 2) return;
+    const charName = ctx.name2 || 'the character';
+    const userName = ctx.name1 || 'the player';
+    const from = Math.max(0, chat.length - 8);
+    const transcript = chat.slice(from).map(m =>
+        `${m.is_user ? userName : (m.name || charName)}: ${stripSceneTags(m.mes).slice(0, 500)}`).join('\n');
+    setAssistStatus('Composing your reply...');
+    try {
+        await requireApi();
+        const raw = await ctx.generateRaw({
+            prompt: [
+                `You write the next reply for the human player "${userName}" in an ongoing roleplay.`,
+                'Recent scene:', transcript,
+                `Direction for this reply: ${option.guide}.`,
+                `Write it exactly as this player would: first person, in the same language the player has used so far (check their earlier lines), 1-3 sentences. The reply must never narrate or speak for ${charName}.`,
+            ].join('\n'),
+            systemPrompt: PLAYER_REPLY_SYSTEM,
         });
-        bar.appendChild(pill);
+        let text = String(raw ?? '').trim();
+        if (!text) throw new Error('empty reply — connect the chat API first');
+        text = stripSceneTags(text);
+        text = fixQuoteRuns(text);
+        // the model may wrap the reply in quotes or prefix the player's name
+        text = text.replace(/^"(.*)"$/s, '$1').trim();
+        const nameRe = userName ? new RegExp('^' + userName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[:—-]\\s*', 'i') : null;
+        if (nameRe && nameRe.test(text)) text = text.replace(nameRe, '');
+        text = text.trim();
+        if (!text) throw new Error('empty reply');
+        sendUserText(text);
+    } catch (e) {
+        toastr.info(`Could not compose a reply (${String(e).slice(0, 90)})`, 'VN Theatre');
+    } finally {
+        setAssistStatus('');
     }
-    const refresh = el('button', 'vnt-choice vnt-choice-refresh', '<i class="fa-solid fa-rotate"></i>');
-    refresh.title = 'Regenerate options';
-    refresh.addEventListener('click', () => { bar.remove(); generateChoices(); });
-    bar.appendChild(refresh);
+}
+
+function sendUserText(text) {
+    const ta = document.querySelector('#send_textarea');
+    if (!ta) return;
+    ta.value = text;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    document.querySelector('#send_but')?.click();
 }
 
 // ===================================================================
@@ -1807,26 +1863,43 @@ function bindEvents() {
                 .then(() => { refresh(); showTranslationUnderMessageById(last.id); })
                 .catch(e => toastr.error(String(e), 'VN Theatre'));
         }
-        // ported systems: judge + choices
+        // ported systems: judge + chips
         if (last) {
             runJudge(last.id);
             if (getSettings().autoChoices) generateChoices();
-            else renderChoices(null);
         }
     });
-    eventSource.on(event_types.MESSAGE_SENT, () => renderChoices(null));
+    // the used options are gone once the player speaks; the next character
+    // reply generates fresh ones for the new situation
+    eventSource.on(event_types.MESSAGE_SENT, () => {
+        const s = getSettings();
+        s.chipOptions = [];
+        renderChips(document.querySelector('.vnt-chips'));
+    });
     eventSource.on(event_types.MESSAGE_UPDATED, (id) => { decorateMessage(Number(id)); refresh(); });
     eventSource.on(event_types.MESSAGE_DELETED, scrubAllMessages);
     eventSource.on(event_types.GENERATION_ENDED, () => {
-        if (getSettings().intentArm) {
-            getSettings().intentArm = '';
+        if (getSettings().intentArm || getSettings().intentJudgeDesc) {
+            const s = getSettings();
+            s.intentArm = '';
+            s.intentJudgeDesc = '';
             saveSettingsDebounced();
             updatePromptInjections();
             renderChips(document.querySelector('.vnt-chips'));
         }
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
-        setTimeout(() => { decorateAllMessages(); refresh(); renderDrawer(); updatePromptInjections(); }, 300);
+        setTimeout(() => {
+            decorateAllMessages(); refresh(); renderDrawer(); updatePromptInjections();
+            // chips must match the chat the player is walking into
+            const s = getSettings();
+            s.chipOptions = [];
+            renderChips(document.querySelector('.vnt-chips'));
+            // wait out the chat load, then read the actual scene
+            setTimeout(() => {
+                if (s.autoChoices && (getContext().chat ?? []).length >= 2) generateChoices();
+            }, 1000);
+        }, 300);
     });
 }
 
@@ -1902,7 +1975,12 @@ function buildSettings() {
 
     const q = id => document.querySelector(id);
     q('#vnt-set-judge').addEventListener('change', e => { s.judge = e.target.checked; saveSettingsDebounced(); });
-    q('#vnt-set-choices').addEventListener('change', e => { s.autoChoices = e.target.checked; if (!e.target.checked) renderChoices(null); saveSettingsDebounced(); });
+    q('#vnt-set-choices').addEventListener('change', e => {
+        s.autoChoices = e.target.checked;
+        saveSettingsDebounced();
+        if (e.target.checked) generateChoices();
+        else { s.chipOptions = []; renderChips(document.querySelector('.vnt-chips')); }
+    });
     q('#vnt-set-auto').addEventListener('change', e => { s.autoTranslate = e.target.checked; saveSettingsDebounced(); });
     q('#vnt-set-sfx').addEventListener('change', e => { s.sfx = e.target.checked; saveSettingsDebounced(); });
     q('#vnt-set-lang').addEventListener('change', e => { s.targetLang = e.target.value.trim() || 'ru'; saveSettingsDebounced(); });
@@ -1979,6 +2057,16 @@ jQuery(() => {
     if (getSettings().enabled) setEnabled(true);
     updatePromptInjections();
     setTimeout(decorateAllMessages, 800);
+    // CHAT_CHANGED does not fire on page load: seed the chip row for the
+    // situation the player returns to (stale options from another chat go first)
+    setTimeout(() => {
+        const s = getSettings();
+        const chat = getContext().chat ?? [];
+        if (s.enabled && s.autoChoices && chat.length >= 2) {
+            s.chipOptions = [];
+            generateChoices();
+        }
+    }, 3000);
     // debug/testing hook
     window.__vnt = {
         state: getState,
