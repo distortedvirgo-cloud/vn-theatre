@@ -298,6 +298,7 @@ function sceneInstruction() {
         '[Scene direction: End every response with a single tag in this exact format. The tag is metadata only: never mention or explain it in the dialogue.]',
         '<<scene: expression=ID, background=ID, mood=ID, outfit=ID, effect=ID>>',
         `expression IDs: ${EXPRS.join(', ')}.`,
+        'The character sprite follows the expression line by line: on a line where the emotion visibly changes, put an extra tag <<scene: expression=ID>> on its own line right before the spoken/narrated line that shows the new emotion — the sprite switches when the player reaches that line. Mid-reply tags carry ONLY the expression attribute; the final mandatory tag stays the very last line of the reply.',
         `background IDs: ${BG_KEYS.join(', ')}.`,
         `mood IDs: ${MOOD_IDS.join(', ')}.`,
         `effect IDs: ${[...EFFECT_PRESETS, 'off'].join(', ')} — ambient atmosphere overlay. Pick the one matching weather and place: rain in a storm, snow in winter, fireflies on a summer night in nature, embers near a fire, leaves in an autumn wind, bubbles near water, hearts during romance, sakura under blooming trees, off indoors or in neutral moments. Change effect only when the scene or weather actually changes.`,
@@ -680,6 +681,52 @@ function splitPlaybackSegments(html) {
     return segs;
 }
 
+// expression timeline: scene tags placed mid-reply switch the sprite as the
+// player advances line by line; a trailing tag stays the whole-reply default
+function sceneExpressions(raw) {
+    raw = String(raw ?? '');
+    const matches = [...raw.matchAll(SCENE_TAG_RE)];
+    const marks = [];
+    let cut = 0; // total length of the tags already removed upstream
+    for (const m of matches) {
+        const expr = parseSceneTag(m[0]).expression;
+        if (expr) marks.push({ at: m.index - cut, expr: String(expr).toLowerCase() });
+        cut += m[0].length;
+    }
+    const text = stripSceneTags(raw);
+    const segs = splitPlaybackSegments(text);
+    let cursor = 0;
+    const spans = [];
+    for (const seg of segs) {
+        const start = text.indexOf(seg.text, cursor);
+        spans.push([start, start + seg.text.length]);
+        cursor = start + seg.text.length;
+    }
+    const lastEnd = spans.length ? spans[spans.length - 1][1] : 0;
+    let trailing = null;
+    const timeline = [];
+    for (const mark of marks) {
+        let segIdx = spans.findIndex(([a, b]) => mark.at >= a && mark.at < b);
+        if (segIdx < 0) {
+            // a tag sitting in trimmed-out whitespace: one continuing the
+            // previous line switches the emotion on that very line, one on
+            // its own line affects the next line
+            let k = mark.at - 1;
+            while (k >= 0 && (text[k] === ' ' || text[k] === '\t')) k--;
+            if (k >= 0 && text[k] !== '\n') {
+                for (let i = spans.length - 1; i >= 0; i--) {
+                    if (spans[i][1] <= mark.at) { segIdx = i; break; }
+                }
+            } else {
+                segIdx = spans.findIndex(([a]) => a >= mark.at);
+            }
+            if (segIdx < 0) { trailing = mark.expr; continue; }
+        }
+        timeline.push({ from: segIdx, expr: mark.expr });
+    }
+    return { count: segs.length, timeline, trailing };
+}
+
 function skipTypewriter() {
     if (!typeTimer) return false;
     stopTypewriter();
@@ -1030,7 +1077,6 @@ function refresh() {
     const st = getState();
     if (last) {
         const scene = parseSceneTag(last.mes.mes);
-        const expr = scene.expression || 'neutral';
         const text = stripSceneTags(last.mes.mes);
         ui.querySelector('.vnt-name').textContent = last.mes.name || chName || '...';
         const sub = ui.querySelector('.vnt-subname');
@@ -1084,6 +1130,17 @@ function refresh() {
         ui.querySelector('.vnt-namerow')?.classList.toggle('vnt-hidden', cur.type !== 'speech');
         ui.querySelector('.vnt-advance')?.classList.toggle('vnt-hidden', playSeg >= playSegs.length - 1);
         ui.querySelector('.vnt-composer')?.classList.toggle('vnt-hidden', playSeg < playSegs.length - 1);
+        // sprite expression follows the played line: mid-reply scene tags
+        // switch it as lines advance, otherwise the trailing tag / default
+        const timeline = sceneExpressions(last.mes.mes);
+        let segExpr;
+        if (playSegs.length === timeline.count) {
+            segExpr = [...timeline.timeline].reverse().find(t => t.from <= playSeg)?.expr
+                ?? timeline.trailing ?? 'neutral';
+        } else {
+            // translation reshaped the lines — fall back to the message-level tag
+            segExpr = scene.expression || 'neutral';
+        }
         // the separate translation strip under the text is retired — the
         // translation now lives in the dialog box itself
         const trEl = ui.querySelector('.vnt-translation');
@@ -1097,7 +1154,7 @@ function refresh() {
         const cgMap = img.cgMap?.[chatKey()];
         const cgOn = !!(cgActive && cgMap && Number(cgMap.mesId) <= Number(last.id));
         setCG(cgOn ? cgMap.url : '');
-        if (!cgOn) renderCast(last.mes.name || chName, expr);
+        if (!cgOn) renderCast(last.mes.name || chName, segExpr);
         // remember scene in state
         let sceneChanged = false;
         let outfitChanged = false;
